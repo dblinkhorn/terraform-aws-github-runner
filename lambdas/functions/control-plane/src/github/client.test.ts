@@ -5,8 +5,8 @@ import { RequestInterface, RequestParameters } from '@octokit/types';
 import { getParameter } from '@aws-github-runner/aws-ssm-util';
 import * as nock from 'nock';
 
-import { createGithubAppAuth, createOctokitClient } from './auth';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { createGithubAppAuth, createOctokitClient } from './client';
 
 type MockProxy<T> = T & {
   mockImplementation: (fn: (...args: T[]) => T) => MockProxy<T>;
