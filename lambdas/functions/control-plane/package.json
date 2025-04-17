@@ -40,8 +40,8 @@
     "@octokit/core": "6.1.5",
     "@octokit/plugin-throttling": "10.0.0",
     "@octokit/rest": "21.1.1",
-    "cron-parser": "^5.0.4",
     "@octokit/types": "^13.8.0",
+    "cron-parser": "^5.0.4",
     "toad-cache": "^3.7.0",
     "typescript": "^5.7.3"
   },
