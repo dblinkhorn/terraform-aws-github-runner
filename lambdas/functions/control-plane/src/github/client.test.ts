@@ -1,209 +1,88 @@
-import { createAppAuth } from '@octokit/auth-app';
-import { StrategyOptions } from '@octokit/auth-app/dist-types/types';
-import { request } from '@octokit/request';
-import { RequestInterface, RequestParameters } from '@octokit/types';
-import { getParameter } from '@aws-github-runner/aws-ssm-util';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { Octokit } from '@octokit/rest';
 import * as nock from 'nock';
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { createGithubAppAuth, createOctokitClient } from './client';
-
-type MockProxy<T> = T & {
-  mockImplementation: (fn: (...args: T[]) => T) => MockProxy<T>;
-  mockResolvedValue: (value: T) => MockProxy<T>;
-  mockRejectedValue: (value: T) => MockProxy<T>;
-  mockReturnValue: (value: T) => MockProxy<T>;
-};
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const mock = <T>(implementation?: any): MockProxy<T> => vi.fn(implementation) as any;
-
-vi.mock('@aws-github-runner/aws-ssm-util');
-vi.mock('@octokit/auth-app');
+import {
+  createAppAuthClient,
+  createAppInstallationClient,
+  getGitHubEnterpriseApiUrl,
+} from './client';
 
 const cleanEnv = process.env;
-const ENVIRONMENT = 'dev';
-const GITHUB_APP_ID = '1';
-const PARAMETER_GITHUB_APP_ID_NAME = `/actions-runner/${ENVIRONMENT}/github_app_id`;
-const PARAMETER_GITHUB_APP_KEY_BASE64_NAME = `/actions-runner/${ENVIRONMENT}/github_app_key_base64`;
-
-const mockedGet = vi.mocked(getParameter);
 
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
   process.env = { ...cleanEnv };
-  process.env.PARAMETER_GITHUB_APP_ID_NAME = PARAMETER_GITHUB_APP_ID_NAME;
-  process.env.PARAMETER_GITHUB_APP_KEY_BASE64_NAME = PARAMETER_GITHUB_APP_KEY_BASE64_NAME;
+  process.env.PARAMETER_GITHUB_APP_ID_NAME = '/test/app/id';
+  process.env.PARAMETER_GITHUB_APP_KEY_BASE64_NAME = '/test/app/key';
+  process.env.GITHUB_APP_ID = '1337';
+  process.env.GITHUB_APP_KEY_BASE64 = Buffer.from('test-key', 'utf-8').toString('base64');
+  process.env.RUNNER_OWNER = 'test-org';
   nock.disableNetConnect();
 });
 
-describe('Test createOctoClient', () => {
-  it('Creates app client to GitHub public', async () => {
-    // Arrange
-    const token = '123456';
+// Mock getParameter to return test values
+vi.mock('@aws-github-runner/aws-ssm-util', () => ({
+  getParameter: vi.fn((name: string) => {
+    if (name === process.env.PARAMETER_GITHUB_APP_ID_NAME) return Promise.resolve('1337');
+    if (name === process.env.PARAMETER_GITHUB_APP_KEY_BASE64_NAME) {
+      return Promise.resolve(process.env.GITHUB_APP_KEY_BASE64);
+    }
+    return Promise.resolve('');
+  }),
+}));
 
-    // Act
-    const result = await createOctokitClient(token);
-
-    // Assert
-    expect(result.request.endpoint.DEFAULTS.baseUrl).toBe('https://api.github.com');
+describe('client.ts', () => {
+  it('getGitHubEnterpriseApiUrl returns correct URLs', () => {
+    process.env.GHES_URL = 'https://github.example.ghe.com';
+    const { ghesApiUrl, ghesBaseUrl } = getGitHubEnterpriseApiUrl();
+    expect(ghesApiUrl).toBe('https://api.github.example.ghe.com');
+    expect(ghesBaseUrl).toBe('https://github.example.ghe.com');
   });
 
-  it('Creates app client to GitHub ES', async () => {
-    // Arrange
-    const enterpriseServer = 'https://github.enterprise.notgoingtowork';
-    const token = '123456';
-
-    // Act
-    const result = await createOctokitClient(token, enterpriseServer);
-
-    // Assert
-    expect(result.request.endpoint.DEFAULTS.baseUrl).toBe(enterpriseServer);
-    expect(result.request.endpoint.DEFAULTS.mediaType.previews).toStrictEqual(['antiope']);
-  });
-});
-
-describe('Test createGithubAppAuth', () => {
-  const mockedCreatAppAuth = vi.mocked(createAppAuth);
-  let mockedRequestInterface: MockProxy<RequestInterface>;
-
-  const installationId = 1;
-  const authType = 'app';
-  const token = '123456';
-  const decryptedValue = 'decryptedValue';
-  const b64 = Buffer.from(decryptedValue, 'binary').toString('base64');
-
-  beforeEach(() => {
-    process.env.ENVIRONMENT = ENVIRONMENT;
+  it('createAppAuthClient returns an Octokit instance', async () => {
+    const octokit = await createAppAuthClient();
+    expect(octokit).toBeInstanceOf(Octokit);
   });
 
-  it('Creates auth object with line breaks in SSH key.', async () => {
-    // Arrange
-    const authOptions = {
-      appId: parseInt(GITHUB_APP_ID),
-      privateKey: `${decryptedValue}
-${decryptedValue}`,
-      installationId,
+  it('createAppInstallationClient returns an installation-scoped Octokit', async () => {
+    const fakeToken = 'installation-token';
+    const fakeInstallationId = 1234;
+
+    // Create a real Octokit instance for the mock to return
+    const mockOctokitInstance = new Octokit({ auth: fakeToken });
+
+    // Create app-level Octokit mock with all required methods
+    const appOctokit = {
+      apps: {
+        getOrgInstallation: vi.fn().mockResolvedValue({ data: { id: fakeInstallationId } }),
+      },
+      // This is the key part - auth() just returns our pre-configured Octokit
+      auth: vi.fn().mockResolvedValue(mockOctokitInstance),
+      request: { endpoint: { parse: vi.fn().mockReturnValue({ url: '' }) } },
+      hook: { before: vi.fn(), after: vi.fn(), error: vi.fn() },
+    } as unknown as Octokit;
+
+    const payload = {
+      id: 0,
+      eventType: 'workflow_job',
+      repositoryName: '',
+      repositoryOwner: 'test-org',
+      installationId: 0,
+      repoOwnerType: 'Organization',
     };
 
-    const b64PrivateKeyWithLineBreaks = Buffer.from(decryptedValue + '\n' + decryptedValue, 'binary').toString(
-      'base64',
-    );
-    mockedGet.mockResolvedValueOnce(GITHUB_APP_ID).mockResolvedValueOnce(b64PrivateKeyWithLineBreaks);
-
-    const mockedAuth = vi.fn();
-    mockedAuth.mockResolvedValue({ token });
-    // Add the required hook method to make it compatible with AuthInterface
-    const mockWithHook = Object.assign(mockedAuth, { hook: vi.fn() });
-    mockedCreatAppAuth.mockReturnValue(mockWithHook);
-
     // Act
-    await createGithubAppAuth(installationId);
+    const installationClient = await createAppInstallationClient(appOctokit, true, payload);
 
     // Assert
-    expect(mockedCreatAppAuth).toBeCalledTimes(1);
-    expect(mockedCreatAppAuth).toBeCalledWith({ ...authOptions });
-  });
-
-  it('Creates auth object for public GitHub', async () => {
-    // Arrange
-    const authOptions = {
-      appId: parseInt(GITHUB_APP_ID),
-      privateKey: decryptedValue,
-      installationId,
-    };
-    mockedGet.mockResolvedValueOnce(GITHUB_APP_ID).mockResolvedValueOnce(b64);
-
-    const mockedAuth = vi.fn();
-    mockedAuth.mockResolvedValue({ token });
-    // Add the required hook method to make it compatible with AuthInterface
-    const mockWithHook = Object.assign(mockedAuth, { hook: vi.fn() });
-    mockedCreatAppAuth.mockReturnValue(mockWithHook);
-
-    // Act
-    const result = await createGithubAppAuth(installationId);
-
-    // Assert
-    expect(getParameter).toBeCalledWith(PARAMETER_GITHUB_APP_ID_NAME);
-    expect(getParameter).toBeCalledWith(PARAMETER_GITHUB_APP_KEY_BASE64_NAME);
-
-    expect(mockedCreatAppAuth).toBeCalledTimes(1);
-    expect(mockedCreatAppAuth).toBeCalledWith({ ...authOptions });
-    expect(mockedAuth).toBeCalledWith({ type: authType });
-    expect(result.token).toBe(token);
-  });
-
-  it('Creates auth object for Enterprise Server', async () => {
-    // Arrange
-    const githubServerUrl = 'https://github.enterprise.notgoingtowork';
-
-    mockedRequestInterface = mock<RequestInterface>();
-    vi.spyOn(request, 'defaults').mockImplementation(
-      () => mockedRequestInterface as RequestInterface<object & RequestParameters>,
-    );
-
-    const authOptions = {
-      appId: parseInt(GITHUB_APP_ID),
-      privateKey: decryptedValue,
-      installationId,
-      request: mockedRequestInterface.mockImplementation(() => ({ baseUrl: githubServerUrl })),
-    };
-
-    mockedGet.mockResolvedValueOnce(GITHUB_APP_ID).mockResolvedValueOnce(b64);
-    const mockedAuth = vi.fn();
-    mockedAuth.mockResolvedValue({ token });
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    mockedCreatAppAuth.mockImplementation((authOptions: StrategyOptions) => {
-      return Object.assign(mockedAuth, { hook: vi.fn() });
+    expect(appOctokit.apps.getOrgInstallation).toHaveBeenCalledWith({ org: 'test-org' });
+    expect(appOctokit.auth).toHaveBeenCalledWith({
+      type: 'installation',
+      installationId: fakeInstallationId,
+      factory: expect.any(Function),
     });
-
-    // Act
-    const result = await createGithubAppAuth(installationId, githubServerUrl);
-
-    // Assert
-    expect(getParameter).toBeCalledWith(PARAMETER_GITHUB_APP_ID_NAME);
-    expect(getParameter).toBeCalledWith(PARAMETER_GITHUB_APP_KEY_BASE64_NAME);
-
-    expect(mockedCreatAppAuth).toBeCalledTimes(1);
-    expect(mockedCreatAppAuth).toBeCalledWith(authOptions);
-    expect(mockedAuth).toBeCalledWith({ type: authType });
-    expect(result.token).toBe(token);
-  });
-
-  it('Creates auth object for Enterprise Server with no ID', async () => {
-    // Arrange
-    const githubServerUrl = 'https://github.enterprise.notgoingtowork';
-
-    mockedRequestInterface = mock<RequestInterface>();
-    vi.spyOn(request, 'defaults').mockImplementation(
-      () => mockedRequestInterface as RequestInterface<object & RequestParameters>,
-    );
-
-    const installationId = undefined;
-
-    const authOptions = {
-      appId: parseInt(GITHUB_APP_ID),
-      privateKey: decryptedValue,
-      request: mockedRequestInterface.mockImplementation(() => ({ baseUrl: githubServerUrl })),
-    };
-
-    mockedGet.mockResolvedValueOnce(GITHUB_APP_ID).mockResolvedValueOnce(b64);
-    const mockedAuth = vi.fn();
-    mockedAuth.mockResolvedValue({ token });
-    // Add the required hook method to make it compatible with AuthInterface
-    const mockWithHook = Object.assign(mockedAuth, { hook: vi.fn() });
-    mockedCreatAppAuth.mockReturnValue(mockWithHook);
-
-    // Act
-    const result = await createGithubAppAuth(installationId, githubServerUrl);
-
-    // Assert
-    expect(getParameter).toBeCalledWith(PARAMETER_GITHUB_APP_ID_NAME);
-    expect(getParameter).toBeCalledWith(PARAMETER_GITHUB_APP_KEY_BASE64_NAME);
-
-    expect(mockedCreatAppAuth).toBeCalledTimes(1);
-    expect(mockedCreatAppAuth).toBeCalledWith(authOptions);
-    expect(mockedAuth).toBeCalledWith({ type: authType });
-    expect(result.token).toBe(token);
+    expect(installationClient).toBe(mockOctokitInstance);
   });
 });

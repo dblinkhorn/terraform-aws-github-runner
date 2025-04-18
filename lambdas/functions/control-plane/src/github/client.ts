@@ -1,6 +1,6 @@
 import { createAppAuth } from '@octokit/auth-app';
-import { StrategyOptions } from '@octokit/auth-app/dist-types/types';
-import { OctokitOptions } from '@octokit/core/dist-types/types';
+import type { StrategyOptions } from '@octokit/auth-app';
+import { OctokitOptions } from '@octokit/core';
 import { Octokit } from '@octokit/rest';
 import { throttling } from '@octokit/plugin-throttling';
 import { createChildLogger } from '@aws-github-runner/aws-powertools-util';
@@ -78,7 +78,11 @@ async function beforeRequestHandler(octokit: Octokit, options: Required<Endpoint
  * Last-Modified header, so that it can be returned by future conditional
  * requests if requested again.
  */
-async function afterRequestHandler(octokit: Octokit, response: OctokitResponse<any, number>, options: Required<EndpointDefaults>): Promise<void> {
+async function afterRequestHandler(
+  octokit: Octokit,
+  response: OctokitResponse<number>,
+  options: Required<EndpointDefaults>
+): Promise<void> {
   const { status } = response;
   const { url } = octokit.request.endpoint.parse(options);
   logger.info(`Response received`, { status, url });
@@ -105,7 +109,11 @@ async function afterRequestHandler(octokit: Octokit, response: OctokitResponse<a
  * response. We will get "304 Not Modified" responses when the conditional
  * request is satisfied, and we should return the cached data in that case.
  */
-async function errorRequestHandler(octokit: Octokit, error: Error, options: Required<EndpointDefaults>): Promise<CacheEntry> {
+async function errorRequestHandler(
+  octokit: Octokit,
+  error: Error,
+  options: Required<EndpointDefaults>
+): Promise<CacheEntry> {
   if (!(error instanceof RequestError)) {
     throw error;
   }
@@ -178,7 +186,11 @@ async function getInstallationId(
   ).data.id;
 }
 
-export async function createAppInstallationClient(appOctokit: Octokit, enableOrgLevel: boolean, payload: ActionRequestMessage): Promise<Octokit> {
+export async function createAppInstallationClient(
+  appOctokit: Octokit,
+  enableOrgLevel: boolean,
+  payload: ActionRequestMessage
+): Promise<Octokit> {
   const installationId = await getInstallationId(appOctokit, enableOrgLevel, payload);
 
   return appOctokit.auth({

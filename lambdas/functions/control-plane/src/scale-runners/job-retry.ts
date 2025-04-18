@@ -1,9 +1,10 @@
 import { addPersistentContextToChildLogger, createSingleMetric, logger } from '@aws-github-runner/aws-powertools-util';
 import { publishMessage } from '../aws/sqs';
-import { ActionRequestMessage, ActionRequestMessageRetry, isJobQueued, getGitHubEnterpriseApiUrl } from './scale-up';
-import { getOctokit } from '../github/octokit';
+import { Octokit } from '@octokit/rest';
+import { ActionRequestMessage, ActionRequestMessageRetry, isJobQueued } from './scale-up';
 import { MetricUnit } from '@aws-lambda-powertools/metrics';
 import yn from 'yn';
+import { createAppInstallationClient } from '../github/client';
 
 interface JobRetryConfig {
   enable: boolean;
@@ -36,7 +37,7 @@ export async function publishRetryMessage(payload: ActionRequestMessage): Promis
   }
 }
 
-export async function checkAndRetryJob(payload: ActionRequestMessageRetry): Promise<void> {
+export async function checkAndRetryJob(ghAppClient: Octokit, payload: ActionRequestMessageRetry): Promise<void> {
   const enableOrgLevel = yn(process.env.ENABLE_ORGANIZATION_RUNNERS, { default: true });
   const runnerType = enableOrgLevel ? 'Org' : 'Repo';
   const runnerOwner = enableOrgLevel ? payload.repositoryOwner : `${payload.repositoryOwner}/${payload.repositoryName}`;
@@ -59,11 +60,10 @@ export async function checkAndRetryJob(payload: ActionRequestMessageRetry): Prom
 
   logger.info(`Received event`);
 
-  const { ghesApiUrl } = getGitHubEnterpriseApiUrl();
-  const ghClient = await getOctokit(ghesApiUrl, enableOrgLevel, payload);
+  const githubInstallationClient = await createAppInstallationClient(ghAppClient, enableOrgLevel, payload);
 
   // check job is still queued
-  if (await isJobQueued(ghClient, payload)) {
+  if (await isJobQueued(githubInstallationClient, payload)) {
     await publishMessage(JSON.stringify(payload), jobQueueUrl);
     createMetric(enableMetrics, environment, payload);
     logger.info(`Job is still queued, message published to build queue and will be handled by scale-up.`, { payload });

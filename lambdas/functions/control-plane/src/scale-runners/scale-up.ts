@@ -8,7 +8,10 @@ import { RunnerInputParameters } from './../aws/runners.d';
 import ScaleError from './ScaleError';
 import { publishRetryMessage } from './job-retry';
 import { metricGitHubAppRateLimit } from '../github/rate-limit';
-import { createAppInstallationClient, getGitHubEnterpriseApiUrl } from '../github/client';
+import { createAppAuthClient, getGitHubEnterpriseApiUrl, createAppInstallationClient } from '../github/client';
+
+const { ghesApiUrl, ghesBaseUrl } = getGitHubEnterpriseApiUrl();
+const ghAppClient = await createAppAuthClient(ghesApiUrl);
 
 const logger = createChildLogger('scale-up');
 
@@ -201,7 +204,7 @@ export async function createRunners(
   }
 }
 
-export async function scaleUp(ghAppClient: Octokit, eventSource: string, payload: ActionRequestMessage): Promise<void> {
+export async function scaleUp(eventSource: string, payload: ActionRequestMessage): Promise<void> {
   logger.info(`Received ${payload.eventType} from ${payload.repositoryOwner}/${payload.repositoryName}`);
 
   if (eventSource !== 'aws:sqs') throw Error('Cannot handle non-SQS events!');
@@ -263,8 +266,6 @@ export async function scaleUp(ghAppClient: Octokit, eventSource: string, payload
   });
 
   logger.info(`Received event`);
-
-  const { ghesBaseUrl } = getGitHubEnterpriseApiUrl();
 
   const githubInstallationClient = await createAppInstallationClient(ghAppClient, enableOrgLevel, payload);
 

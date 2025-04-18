@@ -2,7 +2,6 @@ import middy from '@middy/core';
 import { logger, setContext } from '@aws-github-runner/aws-powertools-util';
 import { captureLambdaHandler, tracer } from '@aws-github-runner/aws-powertools-util';
 import { Context, SQSEvent } from 'aws-lambda';
-
 import { PoolEvent, adjust } from './pool/pool';
 import ScaleError from './scale-runners/ScaleError';
 import { scaleDown } from './scale-runners/scale-down';
@@ -12,7 +11,6 @@ import { checkAndRetryJob } from './scale-runners/job-retry';
 import { createAppAuthClient, getGitHubEnterpriseApiUrl } from './github/client';
 
 const { ghesApiUrl } = getGitHubEnterpriseApiUrl();
-// TODO: needs to be ESM for top-level await, or we create this lazily.
 const ghAppClient = await createAppAuthClient(ghesApiUrl);
 
 export async function scaleUpHandler(event: SQSEvent, context: Context): Promise<void> {
@@ -25,7 +23,7 @@ export async function scaleUpHandler(event: SQSEvent, context: Context): Promise
   }
 
   try {
-    await scaleUp(ghAppClient, event.Records[0].eventSource, JSON.parse(event.Records[0].body));
+    await scaleUp(event.Records[0].eventSource, JSON.parse(event.Records[0].body));
   } catch (e) {
     if (e instanceof ScaleError) {
       return Promise.reject(e);
@@ -89,7 +87,7 @@ export async function jobRetryCheck(event: SQSEvent, context: Context): Promise<
 
   for (const record of event.Records) {
     const payload = JSON.parse(record.body);
-    await checkAndRetryJob(payload).catch((e) => {
+    await checkAndRetryJob(ghAppClient, payload).catch((e) => {
       logger.warn(`Error processing job retry: ${e.message}`, { error: e });
     });
   }
