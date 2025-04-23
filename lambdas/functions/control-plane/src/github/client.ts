@@ -12,7 +12,7 @@ import type { ActionRequestMessage } from '../scale-runners/scale-up';
 
 const logger = createChildLogger('gh-auth');
 
-interface CacheEntry {
+export interface CacheEntry {
   etag?: string;
   lastModified?: string;
   [key: string]: unknown;
@@ -44,7 +44,11 @@ async function appAuthCommonParameters(): Promise<StrategyOptions> {
  * Handler run before requests are sent. Looks up the URL in the cache, and adds
  * headers for conditional retrieval if there is an entry.
  */
-async function beforeRequestHandler(octokit: Octokit, options: Required<EndpointDefaults>): Promise<void> {
+export async function beforeRequestHandler(
+  cache: Lru<CacheEntry>,
+  octokit: Octokit,
+  options: EndpointDefaults
+): Promise<void> {
   const { method } = options;
 
   if (method !== 'GET') {
@@ -78,10 +82,10 @@ async function beforeRequestHandler(octokit: Octokit, options: Required<Endpoint
  * Last-Modified header, so that it can be returned by future conditional
  * requests if requested again.
  */
-async function afterRequestHandler(
+export async function afterRequestHandler(
   octokit: Octokit,
   response: OctokitResponse<number>,
-  options: Required<EndpointDefaults>
+  options: EndpointDefaults
 ): Promise<void> {
   const { status } = response;
   const { url } = octokit.request.endpoint.parse(options);
@@ -109,10 +113,10 @@ async function afterRequestHandler(
  * response. We will get "304 Not Modified" responses when the conditional
  * request is satisfied, and we should return the cached data in that case.
  */
-async function errorRequestHandler(
+export async function errorRequestHandler(
   octokit: Octokit,
-  error: Error,
-  options: Required<EndpointDefaults>
+  error: Error | RequestError,
+  options: EndpointDefaults
 ): Promise<CacheEntry> {
   if (!(error instanceof RequestError)) {
     throw error;
@@ -144,12 +148,12 @@ export async function createAppAuthClient(ghesApiUrl: string = ''): Promise<Octo
     baseUrl: ghesApiUrl || undefined,
     previews: ghesApiUrl ? ['antiope'] : undefined,
     throttle: {
-      onRateLimit: (retryAfter: number, options: Required<EndpointDefaults>) => {
+      onRateLimit: (retryAfter: number, options: EndpointDefaults) => {
         logger.warn(`GitHub rate limit: Request quota exhausted for request ${options.method} ${options.url}.`, {
           retryAfter,
         });
       },
-      onSecondaryRateLimit: (retryAfter: number, options: Required<EndpointDefaults>) => {
+      onSecondaryRateLimit: (retryAfter: number, options: EndpointDefaults) => {
         logger.warn(`GitHub rate limit: SecondaryRateLimit detected for request ${options.method} ${options.url}`, {
           retryAfter,
         });
@@ -158,14 +162,14 @@ export async function createAppAuthClient(ghesApiUrl: string = ''): Promise<Octo
     userAgent: process.env.USER_AGENT || 'github-aws-runners',
   });
 
-  octokit.hook.before('request', async (options) => beforeRequestHandler(octokit, options));
+  octokit.hook.before('request', async (options) => beforeRequestHandler(cache, octokit, options));
   octokit.hook.after('request', async (response, options) => afterRequestHandler(octokit, response, options));
   octokit.hook.error('request', async (error, options) => errorRequestHandler(octokit, error, options));
 
   return octokit;
 }
 
-async function getInstallationId(
+export async function getInstallationId(
   appClient: Octokit,
   enableOrgLevel: boolean,
   payload: ActionRequestMessage,
@@ -196,7 +200,7 @@ export async function createAppInstallationClient(
   return appOctokit.auth({
     type: 'installation',
     installationId,
-    factory: ({ octokitOptions, ...auth }: { octokitOptions: OctokitOptions }) =>
+    factory: ({ octokitOptions, auth }: { octokitOptions: OctokitOptions; auth: string }) =>
       new Octokit({
         ...octokitOptions,
         auth: auth,
