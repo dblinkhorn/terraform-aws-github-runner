@@ -62,8 +62,8 @@ vi.mock('toad-cache', () => {
   return { Lru: vi.fn(() => mockCache) };
 });
 
-describe('client.ts', () => {
-  it('getGitHubEnterpriseApiUrl returns correct URLs', () => {
+describe('getGitHubEnterpriseUrl', () => {
+  it('returns correct URLs', () => {
     process.env.GHES_URL = 'https://github.example.ghe.com';
     const { ghesApiUrl, ghesBaseUrl } = getGitHubEnterpriseApiUrl();
     expect(ghesApiUrl).toBe('https://api.github.example.ghe.com');
@@ -74,45 +74,76 @@ describe('client.ts', () => {
     const octokit = await createAppAuthClient();
     expect(octokit).toBeInstanceOf(Octokit);
   });
+});
 
-  it('createAppInstallationClient returns an installation-scoped Octokit', async () => {
-    const fakeToken = 'installation-token';
-    const fakeInstallationId = 1234;
+describe('createAppInstallationClient', () => {
+  it('returns an installation-scoped Octokit for an organization', async () => {
+    // Arrange
+    const installationOctokit = new Octokit();
 
-    // Create a real Octokit instance for the mock to return
-    const mockOctokitInstance = new Octokit({ auth: fakeToken });
-
-    // Create app-level Octokit mock with all required methods
-    const appOctokit = {
+    const mockAppClient = {
       apps: {
-        getOrgInstallation: vi.fn().mockResolvedValue({ data: { id: fakeInstallationId } }),
+        getOrgInstallation: vi.fn().mockResolvedValue({ data: { id: 12345 } }),
+        getRepoInstallation: vi.fn(),
       },
-      // This is the key part - auth() just returns our pre-configured Octokit
-      auth: vi.fn().mockResolvedValue(mockOctokitInstance),
-      request: { endpoint: { parse: vi.fn().mockReturnValue({ url: '' }) } },
-      hook: { before: vi.fn(), after: vi.fn(), error: vi.fn() },
-    } as unknown as Octokit;
-
-    const payload = {
-      id: 0,
-      eventType: 'workflow_job' as const,
-      repositoryName: '',
-      repositoryOwner: 'test-org',
-      installationId: 0,
-      repoOwnerType: 'Organization',
+      auth: vi.fn().mockResolvedValue(installationOctokit)
     };
 
+    const enableOrgLevel = true;
+    const runnerOwner = 'my-org';
+
     // Act
-    const installationClient = await createAppInstallationClient(appOctokit, true, payload);
+    const installationClient = await createAppInstallationClient(
+      mockAppClient as unknown as Octokit,
+      enableOrgLevel,
+      runnerOwner
+    );
 
     // Assert
-    expect(appOctokit.apps.getOrgInstallation).toHaveBeenCalledWith({ org: 'test-org' });
-    expect(appOctokit.auth).toHaveBeenCalledWith({
-      type: 'installation',
-      installationId: fakeInstallationId,
-      factory: expect.any(Function),
+    expect(mockAppClient.apps.getOrgInstallation).toHaveBeenCalledWith({ org: 'my-org' });
+    expect(mockAppClient.auth).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'installation',
+        installationId: 12345,
+      })
+    );
+    expect(installationClient).toBe(installationOctokit);
+  });
+
+  it('returns an installation-scoped Octokit for a repository', async () => {
+    // Arrange
+    const installationOctokit = new Octokit();
+
+    const mockAppClient = {
+      apps: {
+        getOrgInstallation: vi.fn(),
+        getRepoInstallation: vi.fn().mockResolvedValue({ data: { id: 67890 } }),
+      },
+      auth: vi.fn().mockResolvedValue(installationOctokit)
+    };
+
+    const enableOrgLevel = false;
+    const runnerOwner = 'my-org/my-repo';
+
+    // Act
+    const installationClient = await createAppInstallationClient(
+      mockAppClient as unknown as Octokit,
+      enableOrgLevel,
+      runnerOwner
+    );
+
+    // Assert
+    expect(mockAppClient.apps.getRepoInstallation).toHaveBeenCalledWith({
+      owner: 'my-org',
+      repo: 'my-repo',
     });
-    expect(installationClient).toBe(mockOctokitInstance);
+    expect(mockAppClient.auth).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'installation',
+        installationId: 67890,
+      })
+    );
+    expect(installationClient).toBe(installationOctokit);
   });
 });
 
@@ -283,7 +314,7 @@ describe('errorRequestHandler', () => {
   });
 });
 
-describe('Test createAppAuthClient', () => {
+describe('createAppAuthClient', () => {
   test('Creates app client to GitHub public', async () => {
     // Arrange
     const appId = '1234';

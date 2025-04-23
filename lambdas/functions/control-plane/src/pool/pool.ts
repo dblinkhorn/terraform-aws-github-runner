@@ -1,12 +1,14 @@
 import { Octokit } from '@octokit/rest';
-import { OctokitOptions } from '@octokit/core';
 import { createChildLogger } from '@aws-github-runner/aws-powertools-util';
 import yn from 'yn';
 
 import { bootTimeExceeded, listEC2Runners } from '../aws/runners';
 import { RunnerList } from '../aws/runners.d';
 import { createRunners } from '../scale-runners/scale-up';
-import { getGitHubEnterpriseApiUrl, createAppAuthClient } from '../github/client';
+import { getGitHubEnterpriseApiUrl, createAppAuthClient, createAppInstallationClient } from '../github/client';
+
+const { ghesApiUrl, ghesBaseUrl } = getGitHubEnterpriseApiUrl();
+const ghAppClient = await createAppAuthClient(ghesApiUrl);
 
 const logger = createChildLogger('pool');
 
@@ -43,21 +45,11 @@ export async function adjust(event: PoolEvent): Promise<void> {
     ? (JSON.parse(process.env.ENABLE_ON_DEMAND_FAILOVER_FOR_ERRORS) as [string])
     : [];
 
-  const { ghesApiUrl, ghesBaseUrl } = getGitHubEnterpriseApiUrl();
-  const ghAppClient = await createAppAuthClient(ghesApiUrl);
-
-  const { data } = await ghAppClient.apps.getOrgInstallation({ org: runnerOwner });
-  const installationId = data.id;
-
-  const githubInstallationClient = await ghAppClient.auth({
-    type: 'installation',
-    installationId,
-    factory: ({ octokitOptions, ...auth }: { octokitOptions: OctokitOptions }) =>
-      new Octokit({
-        ...octokitOptions,
-        auth: auth,
-      }),
-  }) as Octokit;
+  const githubInstallationClient = await createAppInstallationClient(
+    ghAppClient,
+    true,
+    runnerOwner
+  );
 
   // Get statusses of runners registed in GitHub
   const runnerStatusses = await getGitHubRegisteredRunnnerStatusses(

@@ -7,41 +7,20 @@ import { RunnerInfo, RunnerList } from './../aws/runners.d';
 import { GhRunners, githubCache } from './cache';
 import { ScalingDownConfig, getEvictionStrategy, getIdleRunnerCount } from './scale-down-config';
 import { metricGitHubAppRateLimit } from '../github/rate-limit';
+import { createAppAuthClient, getGitHubEnterpriseApiUrl, createAppInstallationClient } from '../github/client';
+
+const { ghesApiUrl } = getGitHubEnterpriseApiUrl();
+const ghAppClient = await createAppAuthClient(ghesApiUrl);
 
 const logger = createChildLogger('scale-down');
 
-async function getOrCreateOctokit(runner: RunnerInfo): Promise<Octokit> {
-  const key = runner.owner;
-  const cachedOctokit = githubCache.clients.get(key);
-
-  if (cachedOctokit) {
-    logger.debug(`[createGitHubClientForRunner] Cache hit for ${key}`);
-    return cachedOctokit;
-  }
-
-  logger.debug(`[createGitHubClientForRunner] Cache miss for ${key}`);
-  const { ghesApiUrl } = getGitHubEnterpriseApiUrl();
-  const ghAuthPre = await createGithubAppAuth(undefined, ghesApiUrl);
-  const githubClientPre = await createOctokitClient(ghAuthPre.token, ghesApiUrl);
-
-  const installationId =
-    runner.type === 'Org'
-      ? (
-          await githubClientPre.apps.getOrgInstallation({
-            org: runner.owner,
-          })
-        ).data.id
-      : (
-          await githubClientPre.apps.getRepoInstallation({
-            owner: runner.owner.split('/')[0],
-            repo: runner.owner.split('/')[1],
-          })
-        ).data.id;
-  const ghAuth = await createGithubInstallationAuth(installationId, ghesApiUrl);
-  const octokit = await createOctokitClient(ghAuth.token, ghesApiUrl);
-  githubCache.clients.set(key, octokit);
-
-  return octokit;
+async function createInstallationClient(ghAppClient: Octokit, runner: RunnerInfo): Promise<Octokit> {
+  logger.debug(`[createInstallationClient] Creating client for ${runner.owner}`);
+  return await createAppInstallationClient(
+    ghAppClient,
+    runner.type === 'Org', // enableOrgLevel
+    runner.owner // runnerOwner
+  );
 }
 
 async function getGitHubRunnerBusyState(client: Octokit, ec2runner: RunnerInfo, runnerId: number): Promise<boolean> {
@@ -73,7 +52,7 @@ async function listGitHubRunners(runner: RunnerInfo): Promise<GhRunners> {
   }
 
   logger.debug(`[listGithubRunners] Cache miss for ${key}`);
-  const client = await getOrCreateOctokit(runner);
+  const client = await createInstallationClient(ghAppClient, runner);
   const runners =
     runner.type === 'Org'
       ? await client.paginate(client.actions.listSelfHostedRunnersForOrg, {
@@ -99,7 +78,7 @@ function runnerMinimumTimeExceeded(runner: RunnerInfo): boolean {
 }
 
 async function removeRunner(ec2runner: RunnerInfo, ghRunnerIds: number[]): Promise<void> {
-  const githubAppClient = await getOrCreateOctokit(ec2runner);
+  const githubAppClient = await createInstallationClient(ghAppClient, ec2runner);
   try {
     const states = await Promise.all(
       ghRunnerIds.map(async (ghRunnerId) => {

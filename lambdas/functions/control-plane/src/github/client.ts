@@ -8,7 +8,6 @@ import { getParameter } from '@aws-github-runner/aws-ssm-util';
 import { EndpointDefaults, type OctokitResponse } from '@octokit/types';
 import { RequestError } from '@octokit/request-error';
 import { Lru } from 'toad-cache';
-import type { ActionRequestMessage } from '../scale-runners/scale-up';
 
 const logger = createChildLogger('gh-auth');
 
@@ -169,43 +168,61 @@ export async function createAppAuthClient(ghesApiUrl: string = ''): Promise<Octo
   return octokit;
 }
 
+/**
+ * Retrieves the installation ID for a given runner owner.
+ * @param appClient - The app-level Octokit client.
+ * @param runnerOwner - The owner of the runner (organization or repository).
+ * @param isOrg - Whether the runner owner is an organization.
+ * @returns The installation ID.
+ */
 export async function getInstallationId(
   appClient: Octokit,
-  enableOrgLevel: boolean,
-  payload: ActionRequestMessage,
+  runnerOwner: string,
+  isOrg: boolean
 ): Promise<number> {
-  if (payload.installationId !== 0) {
-    return payload.installationId;
+  if (isOrg) {
+    const { data } = await appClient.apps.getOrgInstallation({ org: runnerOwner });
+    return data.id;
   }
-
-  return (
-    enableOrgLevel
-      ? await appClient.apps.getOrgInstallation({
-          org: payload.repositoryOwner,
-        })
-      : await appClient.apps.getRepoInstallation({
-          owner: payload.repositoryOwner,
-          repo: payload.repositoryName,
-        })
-  ).data.id;
+  const [owner, repo] = runnerOwner.split('/');
+  const { data } = await appClient.apps.getRepoInstallation({ owner, repo });
+  return data.id;
 }
 
+/**
+ * Creates an installation-level Octokit client for a given runner owner.
+ * @param appClient - The app-level Octokit client.
+ * @param enableOrgLevel - Whether the runner owner is an organization.
+ * @param runnerOwner - The owner of the runner (organization or repository).
+ * @returns An installation-level Octokit client.
+ */
 export async function createAppInstallationClient(
-  appOctokit: Octokit,
+  ghAppClient: Octokit,
   enableOrgLevel: boolean,
-  payload: ActionRequestMessage
+  runnerOwner: string
 ): Promise<Octokit> {
-  const installationId = await getInstallationId(appOctokit, enableOrgLevel, payload);
+  const installationId = enableOrgLevel
+    ? (
+        await ghAppClient.apps.getOrgInstallation({
+          org: runnerOwner,
+        })
+      ).data.id
+    : (
+        await ghAppClient.apps.getRepoInstallation({
+          owner: runnerOwner.split('/')[0],
+          repo: runnerOwner.split('/')[1],
+        })
+      ).data.id;
 
-  return appOctokit.auth({
+  return (await ghAppClient.auth({
     type: 'installation',
     installationId,
-    factory: ({ octokitOptions, auth }: { octokitOptions: OctokitOptions; auth: string }) =>
+    factory: ({ octokitOptions, ...auth }: { octokitOptions: OctokitOptions }) =>
       new Octokit({
         ...octokitOptions,
         auth: auth,
       }),
-  }) as Promise<Octokit>;
+  })) as Octokit;
 }
 
 export function getGitHubEnterpriseApiUrl() {

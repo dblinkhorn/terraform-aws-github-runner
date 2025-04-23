@@ -60,7 +60,7 @@ export async function checkAndRetryJob(ghAppClient: Octokit, payload: ActionRequ
 
   logger.info(`Received event`);
 
-  const githubInstallationClient = await createAppInstallationClient(ghAppClient, enableOrgLevel, payload);
+  const githubInstallationClient = await createAppInstallationClient(ghAppClient, enableOrgLevel, runnerOwner);
 
   // check job is still queued
   if (await isJobQueued(githubInstallationClient, payload)) {
