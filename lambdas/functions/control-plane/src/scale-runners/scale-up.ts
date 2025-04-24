@@ -8,10 +8,7 @@ import { RunnerInputParameters } from './../aws/runners.d';
 import ScaleError from './ScaleError';
 import { publishRetryMessage } from './job-retry';
 import { metricGitHubAppRateLimit } from '../github/rate-limit';
-import { createAppAuthClient, getGitHubEnterpriseApiUrl, createAppInstallationClient } from '../github/client';
-
-const { ghesApiUrl, ghesBaseUrl } = getGitHubEnterpriseApiUrl();
-const ghAppClient = await createAppAuthClient(ghesApiUrl);
+import { createAppInstallationClient } from '../github/client';
 
 const logger = createChildLogger('scale-up');
 
@@ -66,8 +63,16 @@ interface CreateEC2RunnerConfig {
 }
 
 function generateRunnerServiceConfig(githubRunnerConfig: CreateGitHubRunnerConfig, token: string) {
+  const configForGeneration = { ...githubRunnerConfig };
+
+  if (process.env.GHES_URL) {
+    configForGeneration.ghesBaseUrl = process.env.GHES_URL;
+  } else if (!configForGeneration.ghesBaseUrl) {
+    configForGeneration.ghesBaseUrl = 'https://github.com';
+  }
+
   const config = [
-    `--url ${githubRunnerConfig.ghesBaseUrl ?? 'https://github.com'}/${githubRunnerConfig.runnerOwner}`,
+    `--url ${configForGeneration.ghesBaseUrl}/${configForGeneration.runnerOwner}`,
     `--token ${token}`,
   ];
 
@@ -204,7 +209,12 @@ export async function createRunners(
   }
 }
 
-export async function scaleUp(eventSource: string, payload: ActionRequestMessage): Promise<void> {
+export async function scaleUp(
+  eventSource: string,
+  payload: ActionRequestMessage,
+  ghAppClient: Octokit,
+  ghesBaseUrl: string
+): Promise<void> {
   logger.info(`Received ${payload.eventType} from ${payload.repositoryOwner}/${payload.repositoryName}`);
 
   if (eventSource !== 'aws:sqs') throw Error('Cannot handle non-SQS events!');
@@ -267,7 +277,7 @@ export async function scaleUp(eventSource: string, payload: ActionRequestMessage
 
   logger.info(`Received event`);
 
-  const githubInstallationClient = await createAppInstallationClient(ghAppClient, enableOrgLevel, payload);
+  const githubInstallationClient = await createAppInstallationClient(ghAppClient, enableOrgLevel, runnerOwner);
 
   if (!enableJobQueuedCheck || (await isJobQueued(githubInstallationClient, payload))) {
     let scaleUp = true;

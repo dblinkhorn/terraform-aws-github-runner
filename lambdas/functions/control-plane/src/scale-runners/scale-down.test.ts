@@ -3,27 +3,35 @@ import moment from 'moment';
 import nock from 'nock';
 
 import { RunnerInfo, RunnerList } from '../aws/runners.d';
-import * as ghAuth from '../github/client';
+import * as ghClient from '../github/client';
 import { listEC2Runners, terminateRunner, tag } from './../aws/runners';
 import { githubCache } from './cache';
 import { newestFirstStrategy, oldestFirstStrategy, scaleDown } from './scale-down';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-const mockOctokit = {
-  apps: {
-    getOrgInstallation: vi.fn(),
-    getRepoInstallation: vi.fn(),
-  },
-  actions: {
-    listSelfHostedRunnersForRepo: vi.fn(),
-    listSelfHostedRunnersForOrg: vi.fn(),
-    deleteSelfHostedRunnerFromOrg: vi.fn(),
-    deleteSelfHostedRunnerFromRepo: vi.fn(),
-    getSelfHostedRunnerForOrg: vi.fn(),
-    getSelfHostedRunnerForRepo: vi.fn(),
-  },
-  paginate: vi.fn(),
+const mockOctokitApps = {
+  getOrgInstallation: vi.fn(),
+  getRepoInstallation: vi.fn()
 };
+
+const mockOctokitActions = {
+  listSelfHostedRunnersForRepo: vi.fn(),
+  listSelfHostedRunnersForOrg: vi.fn(),
+  deleteSelfHostedRunnerFromOrg: vi.fn(),
+  deleteSelfHostedRunnerFromRepo: vi.fn(),
+  getSelfHostedRunnerForOrg: vi.fn(),
+  getSelfHostedRunnerForRepo: vi.fn()
+};
+
+const mockPaginate = vi.fn();
+
+const mockOctokit = {
+  apps: mockOctokitApps,
+  actions: mockOctokitActions,
+  paginate: mockPaginate,
+  auth: vi.fn()
+} as unknown as Octokit;
+
 vi.mock('@octokit/rest', () => ({
   Octokit: vi.fn().mockImplementation(() => mockOctokit),
 }));
@@ -37,10 +45,11 @@ vi.mock('./../aws/runners', async (importOriginal) => {
     listEC2Runners: vi.fn(),
   };
 });
-vi.mock('./../github/auth', async () => ({
-  createGithubAppAuth: vi.fn(),
-  createGithubInstallationAuth: vi.fn(),
-  createOctokitClient: vi.fn(),
+
+vi.mock('../github/client', async () => ({
+  createAppAuthClient: vi.fn(),
+  createAppInstallationClient: vi.fn(),
+  getGitHubEnterpriseApiUrl: vi.fn().mockReturnValue({ ghesApiUrl: '', ghesBaseUrl: '' }),
 }));
 
 vi.mock('./cache', async () => ({
@@ -56,10 +65,8 @@ vi.mock('./cache', async () => ({
   },
 }));
 
-const mocktokit = Octokit as vi.MockedClass<typeof Octokit>;
-const mockedAppAuth = vi.mocked(ghAuth.createGithubAppAuth);
-const mockedInstallationAuth = vi.mocked(ghAuth.createGithubInstallationAuth);
-const mockCreateClient = vi.mocked(ghAuth.createOctokitClient);
+const mockedCreateAppAuthClient = vi.mocked(ghClient.createAppAuthClient);
+const mockedCreateAppInstallationClient = vi.mocked(ghClient.createAppInstallationClient);
 const mockListRunners = vi.mocked(listEC2Runners);
 const mockTagRunners = vi.mocked(tag);
 const mockTerminateRunners = vi.mocked(terminateRunner);
@@ -103,19 +110,21 @@ describe('Scale down runners', () => {
     vi.resetModules();
     githubCache.clients.clear();
     githubCache.runners.clear();
-    mockOctokit.apps.getOrgInstallation.mockImplementation(() => ({
+
+    mockOctokitApps.getOrgInstallation.mockImplementation(() => ({
       data: {
         id: 'ORG',
       },
     }));
-    mockOctokit.apps.getRepoInstallation.mockImplementation(() => ({
+    mockOctokitApps.getRepoInstallation.mockImplementation(() => ({
       data: {
         id: 'REPO',
       },
     }));
 
-    mockOctokit.paginate.mockResolvedValue([]);
-    mockOctokit.actions.deleteSelfHostedRunnerFromRepo.mockImplementation((repo) => {
+    mockPaginate.mockResolvedValue([]);
+
+    mockOctokitActions.deleteSelfHostedRunnerFromRepo.mockImplementation((repo) => {
       // check if repo.runner_id contains the word "busy". If yes, throw an error else return 204
       if (repo.runner_id.includes('busy')) {
         throw Error();
@@ -124,7 +133,7 @@ describe('Scale down runners', () => {
       }
     });
 
-    mockOctokit.actions.deleteSelfHostedRunnerFromOrg.mockImplementation((repo) => {
+    mockOctokitActions.deleteSelfHostedRunnerFromOrg.mockImplementation((repo) => {
       // check if repo.runner_id contains the word "busy". If yes, throw an error else return 204
       if (repo.runner_id.includes('busy')) {
         throw Error();
@@ -133,7 +142,7 @@ describe('Scale down runners', () => {
       }
     });
 
-    mockOctokit.actions.getSelfHostedRunnerForRepo.mockImplementation((repo) => {
+    mockOctokitActions.getSelfHostedRunnerForRepo.mockImplementation((repo) => {
       if (repo.runner_id.includes('busy')) {
         return {
           data: { busy: true },
@@ -144,7 +153,7 @@ describe('Scale down runners', () => {
         };
       }
     });
-    mockOctokit.actions.getSelfHostedRunnerForOrg.mockImplementation((repo) => {
+    mockOctokitActions.getSelfHostedRunnerForOrg.mockImplementation((repo) => {
       if (repo.runner_id.includes('busy')) {
         return {
           data: { busy: true },
@@ -159,13 +168,13 @@ describe('Scale down runners', () => {
     mockTerminateRunners.mockImplementation(async () => {
       return;
     });
-    mockedAppAuth.mockResolvedValue({
+    mockedCreateAppAuthClient.mockResolvedValue({
       type: 'app',
       token: 'token',
       appId: 1,
       expiresAt: 'some-date',
     });
-    mockedInstallationAuth.mockResolvedValue({
+    mockedCreateAppInstallationClient.mockResolvedValue({
       type: 'token',
       tokenType: 'installation',
       token: 'token',
@@ -175,7 +184,22 @@ describe('Scale down runners', () => {
       repositorySelection: 'all',
       installationId: 0,
     });
-    mockCreateClient.mockResolvedValue(new mocktokit());
+
+    mockedCreateAppInstallationClient.mockImplementation(async (_ghAppClient, enableOrgLevel, runnerOwner) => {
+      if (enableOrgLevel) {
+        mockOctokit.apps.getOrgInstallation({ org: runnerOwner });
+      } else {
+        const [owner, repo] = runnerOwner.split('/');
+        mockOctokit.apps.getRepoInstallation({ owner, repo });
+      }
+
+      return {
+        paginate: mockOctokit.paginate,
+        actions: mockOctokit.actions,
+        apps: mockOctokit.apps,
+        auth: mockOctokit.auth
+      } as unknown as Octokit;
+    });
   });
 
   const endpoints = ['https://api.github.com', 'https://github.enterprise.something', 'https://companyname.ghe.com'];
@@ -195,7 +219,7 @@ describe('Scale down runners', () => {
         mockAwsRunners([]);
 
         // act
-        await scaleDown();
+        await scaleDown(mockOctokit);
 
         // assert
         expect(listEC2Runners).toHaveBeenCalledWith({
@@ -219,7 +243,7 @@ describe('Scale down runners', () => {
         mockListRunners.mockResolvedValue(runners);
         mockAwsRunners(runners);
 
-        await scaleDown();
+        await scaleDown(mockOctokit);
 
         // assert
         expect(listEC2Runners).toHaveBeenCalledWith({
@@ -244,7 +268,7 @@ describe('Scale down runners', () => {
         mockAwsRunners(runners);
 
         // act
-        await scaleDown();
+        await scaleDown(mockOctokit);
 
         // assert
         checkTerminated(runners);
@@ -259,7 +283,7 @@ describe('Scale down runners', () => {
         mockAwsRunners(runners);
 
         // act
-        await scaleDown();
+        await scaleDown(mockOctokit);
 
         // assert
         checkTerminated(runners);
@@ -274,7 +298,7 @@ describe('Scale down runners', () => {
         mockAwsRunners(runners);
 
         // act
-        await scaleDown();
+        await scaleDown(mockOctokit);
 
         // assert
         checkTerminated(runners);
@@ -296,16 +320,16 @@ describe('Scale down runners', () => {
 
         mockGitHubRunners(runners);
         mockAwsRunners(runners);
-        mockOctokit.actions.deleteSelfHostedRunnerFromRepo.mockImplementation(() => {
+        mockOctokitActions.deleteSelfHostedRunnerFromRepo.mockImplementation(() => {
           return { status: 500 };
         });
 
-        mockOctokit.actions.deleteSelfHostedRunnerFromOrg.mockImplementation(() => {
+        mockOctokitActions.deleteSelfHostedRunnerFromOrg.mockImplementation(() => {
           return { status: 500 };
         });
 
         // act and ensure no exception is thrown
-        await expect(scaleDown()).resolves.not.toThrow();
+        await expect(scaleDown(mockOctokit)).resolves.not.toThrow();
 
         // assert
         checkTerminated(runners);
@@ -322,7 +346,7 @@ describe('Scale down runners', () => {
         mockAwsRunners(runners);
 
         // act
-        await scaleDown();
+        await scaleDown(mockOctokit);
 
         // assert
         checkTerminated(runners);
@@ -341,7 +365,7 @@ describe('Scale down runners', () => {
         orphanRunner.shouldBeTerminated = true;
 
         // act
-        await scaleDown();
+        await scaleDown(mockOctokit);
 
         // assert
         checkTerminated(runners);
@@ -360,7 +384,7 @@ describe('Scale down runners', () => {
         });
 
         // act
-        await scaleDown();
+        await scaleDown(mockOctokit);
 
         // assert
         checkTerminated(runners);
@@ -377,7 +401,7 @@ describe('Scale down runners', () => {
           mockAwsRunners(runners);
 
           // ac
-          await scaleDown();
+          await scaleDown(mockOctokit);
 
           // assert
           checkNonTerminated(runners);
@@ -392,7 +416,7 @@ describe('Scale down runners', () => {
           mockTerminateRunners.mockRejectedValue(new Error('Failed to terminate'));
 
           // act and ensure no exception is thrown
-          await scaleDown();
+          await scaleDown(mockOctokit);
 
           // assert
           checkNonTerminated(runners);
@@ -403,10 +427,10 @@ describe('Scale down runners', () => {
         // setup
         const runners = [createRunnerTestData('idle-1', type, MINIMUM_TIME_RUNNING_IN_MINUTES + 1, true, false, false)];
 
-        mockOctokit.actions.deleteSelfHostedRunnerFromOrg.mockImplementation(() => {
+        mockOctokitActions.deleteSelfHostedRunnerFromOrg.mockImplementation(() => {
           return { status: 500 };
         });
-        mockOctokit.actions.deleteSelfHostedRunnerFromRepo.mockImplementation(() => {
+        mockOctokitActions.deleteSelfHostedRunnerFromRepo.mockImplementation(() => {
           return { status: 500 };
         });
 
@@ -414,7 +438,7 @@ describe('Scale down runners', () => {
         mockAwsRunners(runners);
 
         // act and should resolve
-        await expect(scaleDown()).resolves.not.toThrow();
+        await expect(scaleDown(mockOctokit)).resolves.not.toThrow();
 
         // assert
         checkTerminated(runners);
@@ -425,10 +449,10 @@ describe('Scale down runners', () => {
         // setup
         const runners = [createRunnerTestData('idle-1', type, MINIMUM_TIME_RUNNING_IN_MINUTES + 1, true, true, false)];
 
-        mockOctokit.actions.deleteSelfHostedRunnerFromOrg.mockImplementation(() => {
+        mockOctokitActions.deleteSelfHostedRunnerFromOrg.mockImplementation(() => {
           throw new Error('Failed to delete runner');
         });
-        mockOctokit.actions.deleteSelfHostedRunnerFromRepo.mockImplementation(() => {
+        mockOctokitActions.deleteSelfHostedRunnerFromRepo.mockImplementation(() => {
           throw new Error('Failed to delete runner');
         });
 
@@ -436,7 +460,7 @@ describe('Scale down runners', () => {
         mockAwsRunners(runners);
 
         // act
-        await expect(scaleDown()).resolves.not.toThrow();
+        await expect(scaleDown(mockOctokit)).resolves.not.toThrow();
       });
 
       const evictionStrategies = ['oldest_first', 'newest_first'];
@@ -467,7 +491,7 @@ describe('Scale down runners', () => {
           mockAwsRunners(runners);
 
           // act
-          await scaleDown();
+          await scaleDown(mockOctokit);
 
           // assert
           const runnersToTerminate = runners.filter((r) => r.shouldBeTerminated);
@@ -605,7 +629,7 @@ function checkTerminated(runners: RunnerTestItem[]) {
 }
 
 function mockGitHubRunners(runners: RunnerTestItem[]) {
-  mockOctokit.paginate.mockResolvedValue(
+  mockPaginate.mockResolvedValue(
     runners
       .filter((r) => r.registered)
       .map((r) => {

@@ -10,7 +10,7 @@ import { SSMCleanupOptions, cleanSSMTokens } from './scale-runners/ssm-housekeep
 import { checkAndRetryJob } from './scale-runners/job-retry';
 import { createAppAuthClient, getGitHubEnterpriseApiUrl } from './github/client';
 
-const { ghesApiUrl } = getGitHubEnterpriseApiUrl();
+const { ghesApiUrl, ghesBaseUrl } = getGitHubEnterpriseApiUrl();
 const ghAppClient = await createAppAuthClient(ghesApiUrl);
 
 export async function scaleUpHandler(event: SQSEvent, context: Context): Promise<void> {
@@ -23,7 +23,7 @@ export async function scaleUpHandler(event: SQSEvent, context: Context): Promise
   }
 
   try {
-    await scaleUp(event.Records[0].eventSource, JSON.parse(event.Records[0].body));
+    await scaleUp(event.Records[0].eventSource, JSON.parse(event.Records[0].body), ghAppClient, ghesBaseUrl);
   } catch (e) {
     if (e instanceof ScaleError) {
       return Promise.reject(e);
@@ -39,7 +39,7 @@ export async function scaleDownHandler(event: unknown, context: Context): Promis
   logger.logEventIfEnabled(event);
 
   try {
-    await scaleDown();
+    await scaleDown(ghAppClient);
   } catch (e) {
     logger.error(`${(e as Error).message}`, { error: e as Error });
   }
@@ -50,7 +50,7 @@ export async function adjustPool(event: PoolEvent, context: Context): Promise<vo
   logger.logEventIfEnabled(event);
 
   try {
-    await adjust(event);
+    await adjust(event, ghAppClient, ghesBaseUrl);
   } catch (e) {
     logger.error(`Handle error for adjusting pool. ${(e as Error).message}`, { error: e as Error });
   }

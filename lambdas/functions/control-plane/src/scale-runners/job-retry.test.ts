@@ -1,55 +1,88 @@
 import { publishMessage } from '../aws/sqs';
 import { publishRetryMessage, checkAndRetryJob } from './job-retry';
 import { ActionRequestMessage, ActionRequestMessageRetry } from './scale-up';
-import { getOctokit } from '../github/octokit';
-import { Octokit } from '@octokit/rest';
 import { createSingleMetric } from '@aws-github-runner/aws-powertools-util';
+import { Octokit } from '@octokit/rest';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { createAppInstallationClient } from '../github/client';
 
-vi.mock('../aws/sqs', async () => ({
+vi.mock('../aws/sqs', () => ({
   publishMessage: vi.fn(),
 }));
 
-vi.mock('@aws-github-runner/aws-powertools-util', async () => {
-  // This is a workaround for TypeScript's type checking
-  // Use vi.importActual with a type assertion to avoid spread operator type error
-  const actual = (await vi.importActual(
-    '@aws-github-runner/aws-powertools-util',
-  )) as typeof import('@aws-github-runner/aws-powertools-util');
-
+vi.mock('@aws-github-runner/aws-powertools-util', () => {
   return {
-    ...actual,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    createSingleMetric: vi.fn((name: string, unit: string, value: number, dimensions?: Record<string, string>) => {
+    createSingleMetric: vi.fn(() => {
       return {
         addMetadata: vi.fn(),
       };
     }),
+    createChildLogger: vi.fn(() => ({
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    })),
+    addPersistentContextToChildLogger: vi.fn(),
+    logger: {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
   };
 });
+
+vi.mock('../github/client', () => ({
+  createAppAuthClient: vi.fn().mockResolvedValue({}),
+  createAppInstallationClient: vi.fn().mockResolvedValue({
+    actions: {
+      getJobForWorkflowRun: vi.fn(),
+    },
+  }),
+  getGitHubEnterpriseApiUrl: vi.fn().mockReturnValue({
+    ghesApiUrl: 'https://api.github.com',
+    ghesBaseUrl: 'https://github.com'
+  }),
+}));
+
+vi.mock('@octokit/rest', () => {
+  const mockOctokit = {
+    actions: {
+      getJobForWorkflowRun: vi.fn(),
+    },
+  };
+
+  const MockOctokit = vi.fn().mockImplementation(() => mockOctokit);
+
+  return {
+    Octokit: MockOctokit,
+  };
+});
+
+const mockCreateAppInstallationClient = vi.mocked(createAppInstallationClient);
+const mockPublishMessage = vi.mocked(publishMessage);
+const mockCreateSingleMetric = vi.mocked(createSingleMetric);
 
 const cleanEnv = process.env;
 
 beforeEach(() => {
   vi.clearAllMocks();
   process.env = { ...cleanEnv };
+
+  mockCreateAppInstallationClient.mockImplementation(async () => {
+    return {
+      actions: {
+        getJobForWorkflowRun: vi.fn().mockImplementation(() => ({
+          data: {
+            status: 'queued',
+          },
+          headers: {},
+        })),
+      },
+    } as unknown as Octokit;
+  });
 });
-
-const mockOctokit = {
-  actions: {
-    getJobForWorkflowRun: vi.fn(),
-  },
-};
-
-vi.mock('@octokit/rest', async () => ({
-  Octokit: vi.fn().mockImplementation(() => mockOctokit),
-}));
-vi.mock('../github/octokit', async () => ({
-  getOctokit: vi.fn(),
-}));
-
-const mockCreateOctokitClient = vi.mocked(getOctokit);
-mockCreateOctokitClient.mockResolvedValue(new Octokit());
 
 describe('Test job retry publish message', () => {
   const data = [
@@ -104,7 +137,7 @@ describe('Test job retry publish message', () => {
 
     // assert
     if (output.published) {
-      expect(publishMessage).toHaveBeenCalledWith(
+      expect(mockPublishMessage).toHaveBeenCalledWith(
         JSON.stringify({
           ...message,
           retryCounter: output.newRetryCounter,
@@ -113,7 +146,7 @@ describe('Test job retry publish message', () => {
         output.delay,
       );
     } else {
-      expect(publishMessage).not.toHaveBeenCalled();
+      expect(mockPublishMessage).not.toHaveBeenCalled();
     }
   });
 
@@ -130,18 +163,20 @@ describe('Test job retry publish message', () => {
 
     // act
     await expect(publishRetryMessage(message)).resolves.not.toThrow();
-    expect(publishMessage).not.toHaveBeenCalled();
+    expect(mockPublishMessage).not.toHaveBeenCalled();
   });
 });
 
 describe(`Test job retry check`, () => {
   it(`should publish a message for retry if retry is enabled and counter is below max attempts.`, async () => {
-    // setup
-    mockOctokit.actions.getJobForWorkflowRun.mockImplementation(() => ({
-      data: {
-        status: 'queued',
+    mockCreateAppInstallationClient.mockResolvedValueOnce({
+      actions: {
+        getJobForWorkflowRun: vi.fn().mockReturnValue({
+          data: { status: 'queued' },
+          headers: {},
+        }),
       },
-    }));
+    } as unknown as Octokit);
 
     const message: ActionRequestMessageRetry = {
       eventType: 'workflow_job',
@@ -157,26 +192,36 @@ describe(`Test job retry check`, () => {
     process.env.JOB_QUEUE_SCALE_UP_URL =
       'https://sqs.eu-west-1.amazonaws.com/123456789/webhook_events_workflow_job_queue';
 
+    const mockGhAppClient = {} as Octokit;
+
     // act
-    await checkAndRetryJob(message);
+    await checkAndRetryJob(mockGhAppClient, message);
 
     // assert
-    expect(publishMessage).toHaveBeenCalledWith(
+    expect(mockPublishMessage).toHaveBeenCalledWith(
       JSON.stringify({
         ...message,
       }),
       'https://sqs.eu-west-1.amazonaws.com/123456789/webhook_events_workflow_job_queue',
     );
-    expect(createSingleMetric).not.toHaveBeenCalled();
+    expect(mockCreateSingleMetric).not.toHaveBeenCalled();
+    expect(mockCreateAppInstallationClient).toHaveBeenCalledWith(
+      mockGhAppClient,
+      true,
+      'github-aws-runners'
+    );
   });
 
-  it(`should publish a message for retry if retry is enabled and counter is below max attempts.`, async () => {
-    // setup
-    mockOctokit.actions.getJobForWorkflowRun.mockImplementation(() => ({
-      data: {
-        status: 'queued',
+  it(`should publish a message for retry if retry is enabled
+      and counter is below max attempts with metrics.`, async () => {
+    mockCreateAppInstallationClient.mockResolvedValueOnce({
+      actions: {
+        getJobForWorkflowRun: vi.fn().mockReturnValue({
+          data: { status: 'queued' },
+          headers: {},
+        }),
       },
-    }));
+    } as unknown as Octokit);
 
     const message: ActionRequestMessageRetry = {
       eventType: 'workflow_job',
@@ -195,30 +240,34 @@ describe(`Test job retry check`, () => {
     process.env.JOB_QUEUE_SCALE_UP_URL =
       'https://sqs.eu-west-1.amazonaws.com/123456789/webhook_events_workflow_job_queue';
 
+    const mockGhAppClient = {} as Octokit;
+
     // act
-    await checkAndRetryJob(message);
+    await checkAndRetryJob(mockGhAppClient, message);
 
     // assert
-    expect(publishMessage).toHaveBeenCalledWith(
+    expect(mockPublishMessage).toHaveBeenCalledWith(
       JSON.stringify({
         ...message,
       }),
       'https://sqs.eu-west-1.amazonaws.com/123456789/webhook_events_workflow_job_queue',
     );
-    expect(createSingleMetric).toHaveBeenCalled();
-    expect(createSingleMetric).toHaveBeenCalledWith('RetryJob', 'Count', 1, {
+    expect(mockCreateSingleMetric).toHaveBeenCalled();
+    expect(mockCreateSingleMetric).toHaveBeenCalledWith('RetryJob', 'Count', 1, {
       Environment: 'test',
       RetryCount: '1',
     });
   });
 
   it(`should not publish a message for retry when the job is running.`, async () => {
-    // setup
-    mockOctokit.actions.getJobForWorkflowRun.mockImplementation(() => ({
-      data: {
-        status: 'running',
+    mockCreateAppInstallationClient.mockResolvedValueOnce({
+      actions: {
+        getJobForWorkflowRun: vi.fn().mockReturnValue({
+          data: { status: 'running' },
+          headers: {},
+        }),
       },
-    }));
+    } as unknown as Octokit);
 
     const message: ActionRequestMessageRetry = {
       eventType: 'workflow_job',
@@ -234,20 +283,25 @@ describe(`Test job retry check`, () => {
     process.env.JOB_QUEUE_SCALE_UP_URL =
       'https://sqs.eu-west-1.amazonaws.com/123456789/webhook_events_workflow_job_queue';
 
+    const mockGhAppClient = {} as Octokit;
+
     // act
-    await checkAndRetryJob(message);
+    await checkAndRetryJob(mockGhAppClient, message);
 
     // assert
-    expect(publishMessage).not.toHaveBeenCalled();
+    expect(mockPublishMessage).not.toHaveBeenCalled();
   });
 
   it(`should not publish a message for retry if job is no longer queued.`, async () => {
-    // setup
-    mockOctokit.actions.getJobForWorkflowRun.mockImplementation(() => ({
-      data: {
-        status: 'completed',
+    // Set up mock for a completed job
+    mockCreateAppInstallationClient.mockResolvedValueOnce({
+      actions: {
+        getJobForWorkflowRun: vi.fn().mockReturnValue({
+          data: { status: 'completed' },
+          headers: {},
+        }),
       },
-    }));
+    } as unknown as Octokit);
 
     const message: ActionRequestMessageRetry = {
       eventType: 'workflow_job',
@@ -260,10 +314,12 @@ describe(`Test job retry check`, () => {
     };
     process.env.ENABLE_ORGANIZATION_RUNNERS = 'false';
 
+    const mockGhAppClient = {} as Octokit;
+
     // act
-    await checkAndRetryJob(message);
+    await checkAndRetryJob(mockGhAppClient, message);
 
     // assert
-    expect(publishMessage).not.toHaveBeenCalled();
+    expect(mockPublishMessage).not.toHaveBeenCalled();
   });
 });

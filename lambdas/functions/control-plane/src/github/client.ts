@@ -138,6 +138,11 @@ export async function errorRequestHandler(
   return entry;
 }
 
+/**
+ * Creates an authenticated Octokit client for a GitHub App.
+ * @param ghesApiUrl - The base URL for GitHub Enterprise Server API (optional).
+ * @returns A promise that resolves to an authenticated Octokit client.
+ */
 export async function createAppAuthClient(ghesApiUrl: string = ''): Promise<Octokit> {
   const CustomOctokit = Octokit.plugin(throttling);
 
@@ -201,18 +206,7 @@ export async function createAppInstallationClient(
   enableOrgLevel: boolean,
   runnerOwner: string
 ): Promise<Octokit> {
-  const installationId = enableOrgLevel
-    ? (
-        await ghAppClient.apps.getOrgInstallation({
-          org: runnerOwner,
-        })
-      ).data.id
-    : (
-        await ghAppClient.apps.getRepoInstallation({
-          owner: runnerOwner.split('/')[0],
-          repo: runnerOwner.split('/')[1],
-        })
-      ).data.id;
+  const installationId = await getInstallationId(ghAppClient, runnerOwner, enableOrgLevel);
 
   return (await ghAppClient.auth({
     type: 'installation',
@@ -225,6 +219,10 @@ export async function createAppInstallationClient(
   })) as Octokit;
 }
 
+/**
+ * Get the API URL for GitHub Enterprise Server
+ * @returns Object containing the GitHub Enterprise Server API URL and base URL
+ */
 export function getGitHubEnterpriseApiUrl() {
   const ghesBaseUrl = process.env.GHES_URL;
   let ghesApiUrl = '';

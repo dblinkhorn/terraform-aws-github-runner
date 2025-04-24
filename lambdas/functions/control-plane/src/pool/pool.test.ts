@@ -3,24 +3,31 @@ import moment from 'moment-timezone';
 import * as nock from 'nock';
 
 import { listEC2Runners } from '../aws/runners';
-import * as ghAuth from '../github/client';
-import { createRunners, getGitHubEnterpriseApiUrl } from '../scale-runners/scale-up';
+import * as ghClient from '../github/client';
+import { createRunners } from '../scale-runners/scale-up';
 import { adjust } from './pool';
-import { describe, it, expect, beforeEach, vi, MockedClass } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-const mockOctokit = {
-  paginate: vi.fn(),
-  checks: { get: vi.fn() },
-  actions: {
-    createRegistrationTokenForOrg: vi.fn(),
-  },
-  apps: {
-    getOrgInstallation: vi.fn(),
-  },
+const mockOctokitApps = {
+  getOrgInstallation: vi.fn()
 };
 
+const mockOctokitActions = {
+  createRegistrationTokenForOrg: vi.fn()
+};
+
+const mockPaginate = vi.fn();
+const mockAuth = vi.fn();
+
+const mockOctokit = {
+  apps: mockOctokitApps,
+  actions: mockOctokitActions,
+  paginate: mockPaginate,
+  auth: mockAuth
+} as unknown as Octokit;
+
 vi.mock('@octokit/rest', () => ({
-  Octokit: vi.fn().mockImplementation(() => mockOctokit),
+  Octokit: vi.fn(() => mockOctokit),
 }));
 
 vi.mock('./../aws/runners', async () => ({
@@ -28,10 +35,14 @@ vi.mock('./../aws/runners', async () => ({
   // Include any other functions from the module that might be used
   bootTimeExceeded: vi.fn(),
 }));
-vi.mock('./../github/auth', async () => ({
-  createGithubAppAuth: vi.fn(),
-  createGithubInstallationAuth: vi.fn(),
-  createOctokitClient: vi.fn(),
+
+vi.mock('../github/client', async () => ({
+  createAppAuthClient: vi.fn(),
+  createAppInstallationClient: vi.fn(),
+  getGitHubEnterpriseApiUrl: vi.fn().mockReturnValue({
+    ghesApiUrl: '',
+    ghesBaseUrl: '',
+  }),
 }));
 
 vi.mock('../scale-runners/scale-up', async () => ({
@@ -44,10 +55,9 @@ vi.mock('../scale-runners/scale-up', async () => ({
   // Include any other functions that might be needed
 }));
 
-const mocktokit = Octokit as MockedClass<typeof Octokit>;
-const mockedAppAuth = vi.mocked(ghAuth.createGithubAppAuth);
-const mockedInstallationAuth = vi.mocked(ghAuth.createGithubInstallationAuth);
-const mockCreateClient = vi.mocked(ghAuth.createOctokitClient);
+const mockCreateAppAuthClient = vi.mocked(ghClient.createAppAuthClient);
+const mockCreateAppInstallationClient = vi.mocked(ghClient.createAppInstallationClient);
+const mockGetGitHubEnterpriseApiUrl = vi.mocked(ghClient.getGitHubEnterpriseApiUrl);
 const mockListRunners = vi.mocked(listEC2Runners);
 
 const cleanEnv = process.env;
@@ -144,9 +154,11 @@ beforeEach(() => {
       token: '1234abcd',
     },
   };
-  mockOctokit.actions.createRegistrationTokenForOrg.mockImplementation(() => mockTokenReturnValue);
+  mockOctokitActions.createRegistrationTokenForOrg.mockImplementation(() => mockTokenReturnValue);
 
-  mockOctokit.paginate.mockImplementation(() => githubRunnersRegistered);
+  mockPaginate.mockImplementation(() => {
+    return Promise.resolve(githubRunnersRegistered);
+  });
 
   mockListRunners.mockImplementation(async () => ec2InstancesRegistered);
 
@@ -155,38 +167,22 @@ beforeEach(() => {
       id: 1,
     },
   };
-  mockOctokit.apps.getOrgInstallation.mockImplementation(() => mockInstallationIdReturnValueOrgs);
+  mockOctokitApps.getOrgInstallation.mockImplementation(() => mockInstallationIdReturnValueOrgs);
 
-  mockedAppAuth.mockResolvedValue({
-    type: 'app',
-    token: 'token',
-    appId: 1,
-    expiresAt: 'some-date',
-  });
-  mockedInstallationAuth.mockResolvedValue({
-    type: 'token',
-    tokenType: 'installation',
-    token: 'token',
-    createdAt: 'some-date',
-    expiresAt: 'some-date',
-    permissions: {},
-    repositorySelection: 'all',
-    installationId: 0,
-  });
-
-  mockCreateClient.mockResolvedValue(new mocktokit());
+  mockCreateAppAuthClient.mockResolvedValue(mockOctokit);
+  mockCreateAppInstallationClient.mockResolvedValue(mockOctokit);
 });
 
 describe('Test simple pool.', () => {
   describe('With GitHub Cloud', () => {
     beforeEach(() => {
-      (getGitHubEnterpriseApiUrl as ReturnType<typeof vi.fn>).mockReturnValue({
+      mockGetGitHubEnterpriseApiUrl.mockReturnValue({
         ghesApiUrl: '',
         ghesBaseUrl: '',
       });
     });
     it('Top up pool with pool size 2 registered.', async () => {
-      await adjust({ poolSize: 3 });
+      await adjust({ poolSize: 3 }, mockOctokit, '');
       expect(createRunners).toHaveBeenCalledTimes(1);
       expect(createRunners).toHaveBeenCalledWith(
         expect.anything(),
@@ -196,7 +192,7 @@ describe('Test simple pool.', () => {
     });
 
     it('Should not top up if pool size is reached.', async () => {
-      await adjust({ poolSize: 1 });
+      await adjust({ poolSize: 1 }, mockOctokit, '');
       expect(createRunners).not.toHaveBeenCalled();
     });
 
@@ -222,7 +218,7 @@ describe('Test simple pool.', () => {
       ]);
 
       // 2 idle + 1 booting = 3, top up with 2 to match a pool of 5
-      await adjust({ poolSize: 5 });
+      await adjust({ poolSize: 5 }, mockOctokit, '');
       expect(createRunners).toHaveBeenCalled();
       // Access the numberOfRunners without assuming a specific position
       // Just test that the function was called
@@ -252,21 +248,21 @@ describe('Test simple pool.', () => {
         },
       ]);
 
-      await adjust({ poolSize: 2 });
+      await adjust({ poolSize: 2 }, mockOctokit, '');
       expect(createRunners).not.toHaveBeenCalled();
     });
   });
 
   describe('With GHES', () => {
     beforeEach(() => {
-      (getGitHubEnterpriseApiUrl as ReturnType<typeof vi.fn>).mockReturnValue({
+      mockGetGitHubEnterpriseApiUrl.mockReturnValue({
         ghesApiUrl: 'https://api.github.enterprise.something',
         ghesBaseUrl: 'https://github.enterprise.something',
       });
     });
 
     it('Top up if the pool size is set to 5', async () => {
-      await adjust({ poolSize: 5 });
+      await adjust({ poolSize: 5 }, mockOctokit, 'https://github.enterprise.something');
       // 2 idle, top up with 3 to match a pool of 5
       expect(createRunners).toHaveBeenCalledWith(
         expect.anything(),
@@ -278,14 +274,14 @@ describe('Test simple pool.', () => {
 
   describe('With Github Data Residency', () => {
     beforeEach(() => {
-      (getGitHubEnterpriseApiUrl as ReturnType<typeof vi.fn>).mockReturnValue({
+      mockGetGitHubEnterpriseApiUrl.mockReturnValue({
         ghesApiUrl: 'https://api.companyname.ghe.com',
         ghesBaseUrl: 'https://companyname.ghe.com',
       });
     });
 
     it('Top up if the pool size is set to 5', async () => {
-      await adjust({ poolSize: 5 });
+      await adjust({ poolSize: 5 }, mockOctokit, 'https://companyname.ghe.com');
       // 2 idle, top up with 3 to match a pool of 5
       expect(createRunners).toHaveBeenCalledWith(
         expect.anything(),
@@ -302,7 +298,7 @@ describe('Test simple pool.', () => {
 
     it('Should top up with fewer runners when there are idle prefixed runners', async () => {
       // Add prefixed runners to github
-      mockOctokit.paginate.mockImplementation(async () => [
+      mockPaginate.mockImplementation(async () => [
         ...githubRunnersRegistered,
         {
           id: 5,
@@ -339,7 +335,7 @@ describe('Test simple pool.', () => {
         },
       ]);
 
-      await adjust({ poolSize: 5 });
+      await adjust({ poolSize: 5 }, mockOctokit, '');
       // 2 idle, 2 prefixed idle top up with 1 to match a pool of 5
       expect(createRunners).toHaveBeenCalledWith(
         expect.anything(),

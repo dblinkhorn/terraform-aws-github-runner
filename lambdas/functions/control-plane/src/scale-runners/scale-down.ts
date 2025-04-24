@@ -7,10 +7,7 @@ import { RunnerInfo, RunnerList } from './../aws/runners.d';
 import { GhRunners, githubCache } from './cache';
 import { ScalingDownConfig, getEvictionStrategy, getIdleRunnerCount } from './scale-down-config';
 import { metricGitHubAppRateLimit } from '../github/rate-limit';
-import { createAppAuthClient, getGitHubEnterpriseApiUrl, createAppInstallationClient } from '../github/client';
-
-const { ghesApiUrl } = getGitHubEnterpriseApiUrl();
-const ghAppClient = await createAppAuthClient(ghesApiUrl);
+import { createAppInstallationClient } from '../github/client';
 
 const logger = createChildLogger('scale-down');
 
@@ -18,8 +15,8 @@ async function createInstallationClient(ghAppClient: Octokit, runner: RunnerInfo
   logger.debug(`[createInstallationClient] Creating client for ${runner.owner}`);
   return await createAppInstallationClient(
     ghAppClient,
-    runner.type === 'Org', // enableOrgLevel
-    runner.owner // runnerOwner
+    runner.type === 'Org',
+    runner.owner
   );
 }
 
@@ -43,7 +40,7 @@ async function getGitHubRunnerBusyState(client: Octokit, ec2runner: RunnerInfo, 
   return state.data.busy;
 }
 
-async function listGitHubRunners(runner: RunnerInfo): Promise<GhRunners> {
+async function listGitHubRunners(ghAppClient: Octokit, runner: RunnerInfo): Promise<GhRunners> {
   const key = runner.owner as string;
   const cachedRunners = githubCache.runners.get(key);
   if (cachedRunners) {
@@ -77,13 +74,13 @@ function runnerMinimumTimeExceeded(runner: RunnerInfo): boolean {
   return launchTimePlusMinimum < now;
 }
 
-async function removeRunner(ec2runner: RunnerInfo, ghRunnerIds: number[]): Promise<void> {
-  const githubAppClient = await createInstallationClient(ghAppClient, ec2runner);
+async function removeRunner(ghAppClient: Octokit, ec2runner: RunnerInfo, ghRunnerIds: number[]): Promise<void> {
+  const client = await createInstallationClient(ghAppClient, ec2runner);
   try {
     const states = await Promise.all(
       ghRunnerIds.map(async (ghRunnerId) => {
         // Get busy state instead of using the output of listGitHubRunners(...) to minimize to race condition.
-        return await getGitHubRunnerBusyState(githubAppClient, ec2runner, ghRunnerId);
+        return await getGitHubRunnerBusyState(client, ec2runner, ghRunnerId);
       }),
     );
 
@@ -92,11 +89,11 @@ async function removeRunner(ec2runner: RunnerInfo, ghRunnerIds: number[]): Promi
         ghRunnerIds.map(async (ghRunnerId) => {
           return (
             ec2runner.type === 'Org'
-              ? await githubAppClient.actions.deleteSelfHostedRunnerFromOrg({
+              ? await client.actions.deleteSelfHostedRunnerFromOrg({
                   runner_id: ghRunnerId,
                   org: ec2runner.owner,
                 })
-              : await githubAppClient.actions.deleteSelfHostedRunnerFromRepo({
+              : await client.actions.deleteSelfHostedRunnerFromRepo({
                   runner_id: ghRunnerId,
                   owner: ec2runner.owner.split('/')[0],
                   repo: ec2runner.owner.split('/')[1],
@@ -124,6 +121,7 @@ async function removeRunner(ec2runner: RunnerInfo, ghRunnerIds: number[]): Promi
 async function evaluateAndRemoveRunners(
   ec2Runners: RunnerInfo[],
   scaleDownConfigs: ScalingDownConfig[],
+  ghAppClient: Octokit,
 ): Promise<void> {
   let idleCounter = getIdleRunnerCount(scaleDownConfigs);
   const evictionStrategy = getEvictionStrategy(scaleDownConfigs);
@@ -136,7 +134,7 @@ async function evaluateAndRemoveRunners(
     logger.debug(`Found: '${ec2RunnersFiltered.length}' active GitHub runners with owner tag: '${ownerTag}'`);
     logger.debug(`Active GitHub runners with owner tag: '${ownerTag}': ${JSON.stringify(ec2RunnersFiltered)}`);
     for (const ec2Runner of ec2RunnersFiltered) {
-      const ghRunners = await listGitHubRunners(ec2Runner);
+      const ghRunners = await listGitHubRunners(ghAppClient, ec2Runner);
       const ghRunnersFiltered = ghRunners.filter((runner: { name: string }) =>
         runner.name.endsWith(ec2Runner.instanceId),
       );
@@ -154,6 +152,7 @@ async function evaluateAndRemoveRunners(
           } else {
             logger.info(`Terminating all non busy runners.`);
             await removeRunner(
+              ghAppClient,
               ec2Runner,
               ghRunnersFiltered.map((runner: { id: number }) => runner.id),
             );
@@ -214,7 +213,9 @@ function filterRunners(ec2runners: RunnerList[]): RunnerInfo[] {
   return ec2runners.filter((ec2Runner) => ec2Runner.type && !ec2Runner.orphan) as RunnerInfo[];
 }
 
-export async function scaleDown(): Promise<void> {
+export async function scaleDown(ghAppClient: Octokit): Promise<void> {
+  logger.info('Scaling down');
+
   githubCache.reset();
   const environment = process.env.ENVIRONMENT;
   const scaleDownConfigs = JSON.parse(process.env.SCALE_DOWN_CONFIG) as [ScalingDownConfig];
@@ -234,7 +235,7 @@ export async function scaleDown(): Promise<void> {
   }
 
   const runners = filterRunners(ec2Runners);
-  await evaluateAndRemoveRunners(runners, scaleDownConfigs);
+  await evaluateAndRemoveRunners(runners, scaleDownConfigs, ghAppClient);
 
   const activeEc2RunnersCountAfter = (await listRunners(environment)).length;
   logger.info(`Found: '${activeEc2RunnersCountAfter}' active GitHub EC2 runners instances after clean-up.`);

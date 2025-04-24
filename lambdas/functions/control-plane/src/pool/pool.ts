@@ -5,10 +5,7 @@ import yn from 'yn';
 import { bootTimeExceeded, listEC2Runners } from '../aws/runners';
 import { RunnerList } from '../aws/runners.d';
 import { createRunners } from '../scale-runners/scale-up';
-import { getGitHubEnterpriseApiUrl, createAppAuthClient, createAppInstallationClient } from '../github/client';
-
-const { ghesApiUrl, ghesBaseUrl } = getGitHubEnterpriseApiUrl();
-const ghAppClient = await createAppAuthClient(ghesApiUrl);
+import { createAppInstallationClient } from '../github/client';
 
 const logger = createChildLogger('pool');
 
@@ -21,7 +18,7 @@ interface RunnerStatus {
   status: string;
 }
 
-export async function adjust(event: PoolEvent): Promise<void> {
+export async function adjust(event: PoolEvent, ghAppClient: Octokit, ghesBaseUrl: string): Promise<void> {
   logger.info(`Checking current pool size against pool of size: ${event.poolSize}`);
   const runnerLabels = process.env.RUNNER_LABELS || '';
   const runnerGroup = process.env.RUNNER_GROUP_NAME || '';
