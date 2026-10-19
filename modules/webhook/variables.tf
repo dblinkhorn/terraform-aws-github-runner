@@ -23,19 +23,47 @@ variable "tags" {
 }
 
 variable "runner_matcher_config" {
-  description = "SQS queue to publish accepted build events based on the runner type. When exact match is disabled the webhook accepts the event if one of the workflow job labels is part of the matcher. The priority defines the order the matchers are applied."
+  description = "SQS queue to publish accepted build events based on the runner type. `computeProvider` defaults to `ec2`; EC2 is the only provider currently implemented. When exact match is disabled the webhook accepts the event if one of the workflow job labels is part of the matcher. The priority defines the order the matchers are applied. Optional `matcherConfig.enableDynamicLabels` and `matcherConfig.awsDynamicLabelsPolicy` are evaluated by the dispatcher to gate provider dynamic labels per runner. The policy supports `allowed_keys = [<key>]`, `blocked_keys = [<key>]` (cannot be used together with `allowed_keys`), and `restricted_keys = { <key> = { allowed = [globs], denied = [globs], max = number|string } }`; keys use the provider dynamic label suffix form, for example `instance-type` for `ghr-ec2-instance-type`."
   type = map(object({
-    arn = string
-    id  = string
+    arn             = string
+    id              = string
+    computeProvider = optional(string, "ec2")
     matcherConfig = object({
-      labelMatchers = list(list(string))
-      exactMatch    = bool
-      priority      = optional(number, 999)
+      labelMatchers           = list(list(string))
+      exactMatch              = bool
+      bidirectionalLabelMatch = optional(bool, false)
+      priority                = optional(number, 999)
+      enableDynamicLabels     = optional(bool, false)
+      awsDynamicLabelsPolicy = optional(object({
+        allowed_keys = optional(list(string), [])
+        blocked_keys = optional(list(string), [])
+        restricted_keys = optional(map(object({
+          allowed = optional(list(string), [])
+          denied  = optional(list(string), [])
+          max     = optional(string, null)
+        })), {})
+      }), null)
     })
   }))
   validation {
     condition     = try(var.runner_matcher_config.matcherConfig.priority, 999) >= 0 && try(var.runner_matcher_config.matcherConfig.priority, 999) < 1000
     error_message = "The priority of the matcher must be between 0 and 999."
+  }
+  validation {
+    condition = alltrue([
+      for config in values(var.runner_matcher_config) :
+      lower(trimspace(config.computeProvider)) == "ec2"
+    ])
+    error_message = "computeProvider must be ec2."
+  }
+  validation {
+    condition = alltrue([
+      for config in values(var.runner_matcher_config) : !(
+        try(length(config.matcherConfig.awsDynamicLabelsPolicy.allowed_keys), 0) > 0 &&
+        try(length(config.matcherConfig.awsDynamicLabelsPolicy.blocked_keys), 0) > 0
+      )
+    ])
+    error_message = "runner_matcher_config: allowed_keys and blocked_keys cannot both be set in awsDynamicLabelsPolicy."
   }
 }
 
@@ -125,10 +153,14 @@ variable "repository_white_list" {
   default     = []
 }
 
-variable "kms_key_arn" {
-  description = "Optional CMK Key ARN to be used for Parameter Store."
+variable "queue_selection_strategy" {
+  description = "Strategy used to pick a queue when multiple runner configurations match a job equally well. `first` keeps the historical deterministic behaviour (the first matching queue by priority). `random` spreads jobs across the matching queues to avoid concentrating load on a single one. `all` scales up one runner per matching queue and lets the first to become available take the job (favouring speed over cost; this multiplies instance launches and runner registrations per job)."
   type        = string
-  default     = null
+  default     = "first"
+  validation {
+    condition     = contains(["first", "random", "all"], var.queue_selection_strategy)
+    error_message = "`queue_selection_strategy` value not valid. Valid values are 'first', 'random', 'all'."
+  }
 }
 
 variable "log_level" {
@@ -189,14 +221,6 @@ variable "tracing_config" {
   default = {}
 }
 
-variable "ssm_paths" {
-  description = "The root path used in SSM to store configuration and secrets."
-  type = object({
-    root    = string
-    webhook = string
-  })
-}
-
 variable "lambda_tags" {
   description = "Map of tags that will be added to all the lambda function resources. Note these are additional tags to the default tags."
   type        = map(string)
@@ -211,6 +235,22 @@ variable "matcher_config_parameter_store_tier" {
     condition     = contains(["Standard", "Advanced"], var.matcher_config_parameter_store_tier)
     error_message = "`matcher_config_parameter_store_tier` value is not valid, valid values are: `Standard`, and `Advanced`."
   }
+}
+
+variable "storage_provider" {
+  description = "Storage-provider configuration used by the webhook resources."
+  type = object({
+    aws = object({
+      kms_key_id = optional(string, null)
+      ssm = object({
+        paths = object({
+          root    = string
+          webhook = string
+        })
+      })
+    })
+  })
+  nullable = false
 }
 
 variable "eventbridge" {

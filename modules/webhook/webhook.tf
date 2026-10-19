@@ -1,6 +1,11 @@
 locals {
   # config with combined key and order
-  runner_matcher_config = { for k, v in var.runner_matcher_config : format("%03d-%s", v.matcherConfig.priority, k) => merge(v, { key = k }) }
+  runner_matcher_config = {
+    for k, v in var.runner_matcher_config : format("%03d-%s", v.matcherConfig.priority, k) => merge(v, {
+      key             = k
+      computeProvider = lower(trimspace(v.computeProvider))
+    })
+  }
 
   # sorted list
   runner_matcher_config_sorted = [for k in sort(keys(local.runner_matcher_config)) : local.runner_matcher_config[k]]
@@ -40,7 +45,7 @@ locals {
 resource "aws_ssm_parameter" "runner_matcher_config" {
   count = local.total_chunks
 
-  name  = "${var.ssm_paths.root}/${var.ssm_paths.webhook}/runner-matcher-config${local.total_chunks > 1 ? "-${count.index}" : ""}"
+  name  = "${var.storage_provider.aws.ssm.paths.root}/${var.storage_provider.aws.ssm.paths.webhook}/runner-matcher-config${local.total_chunks > 1 ? "-${count.index}" : ""}"
   type  = "String"
   value = local.matcher_json_chunks[count.index]
   tier  = var.matcher_config_parameter_store_tier
@@ -70,15 +75,22 @@ module "direct" {
     lambda_s3_object_version              = var.webhook_lambda_s3_object_version,
     lambda_apigateway_access_log_settings = var.webhook_lambda_apigateway_access_log_settings,
     repository_white_list                 = var.repository_white_list,
-    kms_key_arn                           = var.kms_key_arn,
-    log_level                             = var.log_level,
-    lambda_runtime                        = var.lambda_runtime,
-    aws_partition                         = var.aws_partition,
-    lambda_architecture                   = var.lambda_architecture,
-    github_app_parameters                 = var.github_app_parameters,
-    tracing_config                        = var.tracing_config,
-    lambda_tags                           = var.lambda_tags,
-    api_gw_source_arn                     = "${aws_apigatewayv2_api.webhook.execution_arn}/*/*/${local.webhook_endpoint}"
+    queue_selection_strategy              = var.queue_selection_strategy,
+    storage_provider = {
+      aws = {
+        ssm = {
+          kms_key_id = var.storage_provider.aws.kms_key_id
+        }
+      }
+    }
+    log_level             = var.log_level,
+    lambda_runtime        = var.lambda_runtime,
+    aws_partition         = var.aws_partition,
+    lambda_architecture   = var.lambda_architecture,
+    github_app_parameters = var.github_app_parameters,
+    tracing_config        = var.tracing_config,
+    lambda_tags           = var.lambda_tags,
+    api_gw_source_arn     = "${aws_apigatewayv2_api.webhook.execution_arn}/*/*/${local.webhook_endpoint}"
     ssm_parameter_runner_matcher_config = [
       for p in aws_ssm_parameter.runner_matcher_config : {
         name    = p.name
@@ -112,15 +124,22 @@ module "eventbridge" {
     lambda_s3_object_version              = var.webhook_lambda_s3_object_version,
     lambda_apigateway_access_log_settings = var.webhook_lambda_apigateway_access_log_settings,
     repository_white_list                 = var.repository_white_list,
-    kms_key_arn                           = var.kms_key_arn,
-    log_level                             = var.log_level,
-    lambda_runtime                        = var.lambda_runtime,
-    aws_partition                         = var.aws_partition,
-    lambda_architecture                   = var.lambda_architecture,
-    github_app_parameters                 = var.github_app_parameters,
-    tracing_config                        = var.tracing_config,
-    lambda_tags                           = var.lambda_tags,
-    api_gw_source_arn                     = "${aws_apigatewayv2_api.webhook.execution_arn}/*/*/${local.webhook_endpoint}"
+    queue_selection_strategy              = var.queue_selection_strategy,
+    storage_provider = {
+      aws = {
+        ssm = {
+          kms_key_id = var.storage_provider.aws.kms_key_id
+        }
+      }
+    }
+    log_level             = var.log_level,
+    lambda_runtime        = var.lambda_runtime,
+    aws_partition         = var.aws_partition,
+    lambda_architecture   = var.lambda_architecture,
+    github_app_parameters = var.github_app_parameters,
+    tracing_config        = var.tracing_config,
+    lambda_tags           = var.lambda_tags,
+    api_gw_source_arn     = "${aws_apigatewayv2_api.webhook.execution_arn}/*/*/${local.webhook_endpoint}"
     ssm_parameter_runner_matcher_config = [
       for p in aws_ssm_parameter.runner_matcher_config : {
         name    = p.name

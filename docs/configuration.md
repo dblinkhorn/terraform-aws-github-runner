@@ -17,13 +17,21 @@ To be able to support a number of use-cases, the module has quite a lot of confi
 
 ## AWS SSM Parameters
 
-The module uses the AWS System Manager Parameter Store to store configuration for the runners, as well as registration tokens and secrets for the Lambdas. Paths for the parameters can be configured via the variable `ssm_paths`. The location of the configuration parameters is retrieved by the runners via the instance tag `ghr:ssm_config_path`. The following default paths will be used. Tokens or JIT config stored in the token path will be deleted after retrieval by instance, data not deleted after a day will be deleted by a SSM housekeeper lambda.
+The module uses the AWS System Manager Parameter Store to store configuration for the runners, as well as registration tokens and secrets for the Lambdas. Paths for the parameters can be configured via the variable `ssm_paths`. The location of the configuration parameters is retrieved by the runners via the instance tag `ghr:ssm_config_path`. The following default paths will be used. Tokens or JIT config stored in the token path will be deleted after retrieval by instance, data not deleted after a day will be deleted by a SSM housekeeper lambda. Alternatively you can set `ssm_ttl_seconds.tokens` to attach a native SSM expiration policy to the token / JIT config parameters so SSM deletes leftovers itself after the TTL passes. Be aware that parameter policies require the Advanced parameter tier for every token parameter, which incurs additional costs, and that expiration is enforced asynchronously by SSM. The housekeeper lambda remains active as a backstop.
+
+For the experimental multi-runner configuration, set `multi_runner_config.<lane>.storage_provider.aws.ssm.ttl_seconds.tokens` to configure the token TTL. Stable configurations use `ssm_ttl_seconds.tokens` (under `runner_config` for multi-runner lanes); it is translated to the same nested setting. An omitted TTL leaves native expiration disabled.
+
+The SSM housekeeper collects eligible names across listing pages and sends a `DeleteParameters` request whenever it has 10 names, waiting 350 ms before each batch. Any partial batch is flushed when listing finishes or fails, provided enough runtime remains. It stops listing new pages with less than twenty seconds remaining, reserving time to flush a partial batch, and stops sending delete requests with less than ten seconds remaining, including a time check after the delay. This reduces API calls while pacing each invocation below the default three delete requests per second. The quota is shared across the AWS account and Region, so concurrent housekeepers and other clients can still cause throttling. The AWS SDK retries retryable failures; if a batch still fails, the housekeeper logs it and continues with later batches. Parameters left behind remain eligible for a later scheduled run. Names returned in `InvalidParameters` are logged separately. The configured minimum age still applies, and dry-run mode sends no delete requests.
+
+Each batch logs `Successfully deleted expired runner configuration batch` only for names acknowledged in AWS's `DeletedParameters` response, with `deletedCount`. Sum `deletedCount` to measure confirmed deletions; counting these log entries measures successful batches. The `Runner configuration cleanup summary` log reports parameter counts: `attempted` (submitted names, excluding SDK retries), `deleted` (AWS-confirmed names), `failed` (invalid names or names in failed requests), `skipped` (ineligible entries), and `pending` (buffered names not submitted). It includes `dryRun` and a `status` of `completed`, `runtime-limit`, or `listing-failed`; completed means the scan finished, not that every deletion succeeded. Dry runs report no deletion attempts or successes. Summaries are emitted on normal completion, guarded runtime exits, and listing failures, but cannot be guaranteed after a hard Lambda timeout.
+
+When upgrading the housekeeper Lambda, also apply the Terraform IAM changes granting `ssm:DeleteParameters`; the singular `ssm:DeleteParameter` permission does not authorize batch deletion. Custom IAM policies must grant the batch action for the runner token path as well.
 
 Furthermore, to accommodate larger JIT configurations or other stored values, the module implements automatic tier selection for SSM parameters:
 
--   **Parameter Tiering**: If the size of a parameter's value exceeds 4KB (specifically, 4000 bytes), the module will automatically use the 'Advanced' tier for that SSM parameter. Values smaller than this threshold will use the 'Standard' tier.
--   **Cost Implications**: While the 'Standard' tier is generally free for a certain number of parameters and operations, the 'Advanced' tier incurs costs. These costs are typically pro-rated per hour for each parameter stored using the Advanced tier. For detailed and up-to-date pricing, please refer to the [AWS Systems Manager Pricing page](https://aws.amazon.com/systems-manager/pricing/#Parameter_Store).
--   **Housekeeping Recommendation**: The last sentence of the "AWS SSM Parameters" section already mentions that "data not deleted after a day will be deleted by a SSM housekeeper lambda." It is crucial to ensure this or a similar housekeeping mechanism is active and correctly configured, especially considering the potential costs associated with 'Advanced' tier parameters. This utility should identify and delete any orphaned parameters to help manage costs and maintain a clean SSM environment.
+- **Parameter Tiering**: If the size of a parameter's value exceeds 4KB (specifically, 4000 bytes), the module will automatically use the 'Advanced' tier for that SSM parameter. Values smaller than this threshold will use the 'Standard' tier.
+- **Cost Implications**: While the 'Standard' tier is generally free for a certain number of parameters and operations, the 'Advanced' tier incurs costs. These costs are typically pro-rated per hour for each parameter stored using the Advanced tier. For detailed and up-to-date pricing, please refer to the [AWS Systems Manager Pricing page](https://aws.amazon.com/systems-manager/pricing/#Parameter_Store).
+- **Housekeeping Recommendation**: The last sentence of the "AWS SSM Parameters" section already mentions that "data not deleted after a day will be deleted by a SSM housekeeper lambda." It is crucial to ensure this or a similar housekeeping mechanism is active and correctly configured, especially considering the potential costs associated with 'Advanced' tier parameters. This utility should identify and delete any orphaned parameters to help manage costs and maintain a clean SSM environment.
 
 | Path                                                          | Description                                                                                                                                                                                                                     |
 | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -67,7 +75,7 @@ github_app = {
 
 Manually creating the SSM parameters that hold the configuration of your GitHub App avoids leaking critical plain text values in your terraform state and version control system. This is a recommended security practice for handling sensitive credentials.
 
-You can read more [over here](../examples/external-managed-ssm-secrets/README.md).
+You can read more [over here](examples/external-managed-ssm-secrets.md).
 
 ## Encryption
 
@@ -146,6 +154,18 @@ Cron expressions are parsed by [cron-parser](https://github.com/harrisiirak/cron
 
 For time zones please check [TZ database name column](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) for the supported values.
 
+### Idle confirmation window <!-- omit in toc -->
+
+Before terminating a runner, the scale-down lambda asks GitHub whether the runner is busy. That busy flag can be stale: it can read `false` for a runner that was assigned a job a few seconds earlier, and in rare cases for a runner that has been executing a job for several minutes. When that happens the lambda terminates an instance mid-job and the job fails with "The runner has received a shutdown signal".
+
+Set `scale_down_idle_confirmation_seconds` to require not-busy readings that span at least the given window before a runner is terminated. On the first not-busy reading the lambda tags the instance with `ghr:idle_detected_at` and defers termination. It terminates only when a later evaluation still reads not-busy and the window has elapsed. Any busy reading in between removes the tag and restarts the window. Use at least one scale-down schedule interval, for example `300` for the default five minute schedule, so that two consecutive evaluations must agree. The trade-off is that a genuinely idle runner lives one extra interval before it is removed.
+
+```hcl
+scale_down_idle_confirmation_seconds = 300
+```
+
+The default of `0` keeps the previous single-reading behaviour. The `multi_runner_config` equivalent is `runner_config.scale_down_idle_confirmation_seconds`.
+
 ## Ephemeral runners
 
 You can configure runners to be ephemeral, in which case runners will be used only for one job. The feature should be used in conjunction with listening for the workflow job event. Please consider the following:
@@ -161,7 +181,7 @@ The example for [ephemeral runners](examples/ephemeral.md) is based on the [defa
 
 You can enable the job retry function to retry a job after a delay for a configured number of times. The function is disabled by default. To enable the function set `job_retry.enable` to `true`. The function will check the job status after a delay, and when the is still queued, it will create a new runner. The new runner is created in the same way as the others via the scale-up function. Hence the same configuration applies.
 
-For checking the job status a API call is made to GitHub. Which can exhaust the GitHub API more quickly for larger deployments and cause rate limits. For larger deployment with a lot of frequent jobs having a small pool available could be a better choice.
+For checking the job status a API call is made to GitHub. Which can exhaust the GitHub API more quickly for larger deployments and cause rate limits. For larger deployment with a lot of frequent jobs having a small pool available could be a better choice. See [Rate Limits and Batch Size Tuning](rate-limits-and-tuning.md) for details on GitHub and AWS rate limits.
 
 The option `job_retry.delay_in_seconds` is the delay before the job status is checked. The delay is increased by the factor `job_retry.delay_backoff` for each attempt. The upper bound for a delay is 900 seconds, which is the max message delay on SQS. The maximum number of attempts is configured via `job_retry.max_attempts`. The delay should be set to a higher value than the time it takes to start a runner.
 
@@ -282,6 +302,85 @@ In case the setup does not work as intended, trace the events through this seque
 
 ## Experimental features
 
+### GitHub Actions runner scale-set orchestration
+
+Scale-set orchestration is an experimental multi-runner v2 provider for
+workloads that should use GitHub's runner scale-set message protocol instead of
+webhook-driven Lambda scaling. Select it inside the lane's
+`multi_runner_config.<name>.orchestration_provider` block and pair it with a
+compute provider that implements the scale-set capability contract. The
+controller runs as one ECS Fargate task per resolved controller group and
+reconciles the configured scale sets continuously.
+
+Use scale-set orchestration when the GitHub scale-set API and a long-lived
+controller are the desired ownership model. Continue using webhook
+orchestration when the existing `workflow_job` event, SQS, and Lambda lifecycle
+are the better fit. The two modes must not manage the same runner lane.
+
+The scale-set module resolves GitHub scale sets by their configured name. When
+a named scale set is absent, the controller registers it in the resolved
+runner group and reconciles its system labels at runtime. The TypeScript
+controller is the component that configures GitHub; Terraform never calls the
+GitHub scale-set API. Terraform destroy removes the AWS controller and stops
+reconciliation, but does not issue a GitHub delete. The module requires an
+explicit controller image, preferably an immutable digest. The task reads GitHub App credentials
+and optional discovery-cache values from SSM but does not write discovered IDs
+back to SSM. See the [scale-set provider reference](https://github.com/github-aws-runners/terraform-aws-github-runner/blob/main/modules/orchestration-providers/scale-set/README.md)
+for the complete input schema.
+
+#### Scale-set options and defaults
+
+Set these values under
+`global_config_orchestration_provider.scale_set`. Per-lane scale-set values
+under `multi_runner_config.<lane>.orchestration_provider.scale_set` override
+the corresponding lane settings. The controller image is represented as
+optional in the Terraform type for normalization, but validation requires a
+non-empty value; use an immutable digest.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `grouping.strategy` | `compute_provider` | Pack reconcilers by compute-provider type; use `runner_config` or `custom` to create narrower task/IAM boundaries. |
+| `container.image` | none; required | Controller image reference. Prefer a release digest. |
+| `container.user` | `10001:10001` | Numeric non-root UID/GID used by the application container. |
+| `container.health_port` | `8080` | ECS health-check port. |
+| `container.health_path` | `/healthz` | ECS liveness endpoint; `/readyz` is an application readiness signal. |
+| `container.health_check_command` | `null` | Use the image health check unless an explicit ECS command is required. |
+| `container.health_check_interval` / `timeout` / `retries` | `30` / `5` / `3` | ECS container health-check timing. |
+| `container.health_check_start_period` | `30` | Startup grace period for the ECS health check. |
+| `container.health_stale_after_seconds` | `180` | Controller health staleness threshold. |
+| `container.shutdown_timeout_seconds` | `110` | Controller shutdown grace period. |
+| `container.session_close_timeout_seconds` | `10` | Message-session close timeout. |
+| `container.reconnect_initial_backoff_seconds` / `max` | `1` / `30` | Bounds for reconnect backoff. |
+| `container.stop_timeout_seconds` | `120` | ECS container stop timeout. |
+| `config_store.path_prefix` / `tier` | derived / `Standard` | SSM path prefix and parameter tier for non-secret reconciler configuration. |
+| `ecs.cluster.mode` | `managed` | Create a cluster or use an external cluster. |
+| `ecs.cluster.container_insights` | `true` | Enable ECS container insights on a managed cluster. |
+| `ecs.task.cpu` / `memory` | `512` / `1024` | Fargate task CPU units and memory MiB. |
+| `ecs.task.cpu_architecture` | `X86_64` | Fargate task architecture. |
+| `ecs.task.ephemeral_storage` | `null` | Use the Fargate platform default unless a size is supplied. |
+| `ecs.service.platform_version` | `LATEST` | ECS Fargate platform version. |
+| `ecs.iam.path` / `permissions_boundary` | `/` / `null` | IAM role path and optional permissions boundary. |
+| `network.vpc_id` / `subnet_ids` | required | Private subnets in which the controller service runs. |
+| `network.https_egress.ipv4_cidrs` | `0.0.0.0/0` | Default HTTPS reachability; restrict through GitHub Meta API ranges, NAT, firewall, or proxy as required. |
+| `network.https_egress.ipv6_cidrs` | `[]` | IPv6 HTTPS egress destinations. |
+| `logging.retention_in_days` / `kms_key_id` | `180` / `null` | CloudWatch log retention and optional customer-managed KMS key ID, alias, or ARN. |
+| `logging.log_group_class` | `STANDARD` | CloudWatch log-group class. |
+| `tags` | `{}` | Tags applied to scale-set resources. |
+
+The scale-set lane itself defaults to `runner.group_name = "Default"`,
+`runner.min_runners = 0`, `runner.max_runners = 10`, and
+`runner.boot_time_in_minutes = 10`. Configure the GitHub scope, scale-set
+name, runner owner, and GitHub App SSM references in the lane; credential values
+are not placed in the controller manifest.
+
+The [multi-runner scale-set example](multi-runner-scale-set.md) shows how these
+provider-specific settings coexist with webhook lanes in the same v2
+`multi_runner_config` map.
+
+### macOS Runners
+
+This feature is in early stage and should be considered experimental. The module supports macOS-based GitHub Actions self-hosted runners on AWS EC2 Mac instances (`mac1.metal`, `mac2.metal`, `mac2-m2.metal`). macOS runners require dedicated hosts due to Apple's licensing requirements and have longer boot times (6–20 minutes). Set `runner_os = "osx"` and `use_dedicated_host = true` to enable. See the full [macOS Runners documentation](mac-runners.md) for details.
+
 ### Termination watcher
 
 This feature is in early stage and therefore disabled by default. To enable the watcher, set `instance_termination_watcher.enable = true`.
@@ -327,6 +426,319 @@ Below is an example of the log messages created.
     ]
 }
 ```
+
+### Dynamic Labels
+
+[!WARNING]
+**Security implication:** Dynamic labels are extracted from the `runs-on` labels in incoming `workflow_job` webhook events. These labels originate from what
+users define in their workflow files. Any user with permission to create or modify workflows can inject arbitrary EC2 configuration values — including instance types, AMI IDs, subnet IDs, EBS volumes, placement settings, and more. Unless constrained with `aws_dynamic_labels_policy` in the root module, or `matcherConfig.awsDynamicLabelsPolicy` when configuring matcher entries directly, these values are not validated against label-specific rules before being passed to the EC2 CreateFleet API. This means a malicious or careless workflow author could, for example:
+
+- Launch expensive instance types (e.g., `p5.48xlarge`) to inflate costs
+- Override the AMI (`ghr-ec2-image-id`) to boot a compromised image
+- Target specific subnets (`ghr-ec2-subnet-id`) to escape network boundaries
+- Set arbitrarily large EBS volumes (`ghr-ec2-ebs-volume-size:10000`)
+
+**Only enable this feature in repositories where you trust all workflow contributors.** Consider combining it with [GitHub branch protection
+rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-a-branch-rule/about-branch-rules) and required reviews for workflow file changes.
+
+`blocked_keys` and `restricted_keys` work like a blocklist: any key not on the list is allowed. If GitHub adds a new key later, or a key is simply left off the list, it stays allowed until someone notices and blocks it. `allowed_keys` (below) works the other way: only the listed keys are allowed, everything else is blocked. `allowed_keys` fits best when only a small, known set of keys is needed.
+
+This feature is in early stage and therefore disabled by default. To enable dynamic labels, set `enable_dynamic_labels = true`.
+
+Dynamic labels allow workflow authors to pass arbitrary metadata and EC2 instance overrides directly from the `runs-on` labels in their GitHub Actions workflows. All labels prefixed with `ghr-` are treated as dynamic labels. A deterministic hash of all `ghr-` prefixed labels is computed and used for runner matching, ensuring that each unique combination of dynamic labels routes to the correct runner configuration.
+
+Dynamic labels serve two purposes:
+
+1. **Custom identity / restriction labels (`ghr-<key>:<value>`)** — Any `ghr-` prefixed label that is _not_ `ghr-ec2-` acts as a custom identity label. These can represent a unique job ID, a team name, a cost center, an environment tag, or any arbitrary restriction. They do not affect EC2 configuration but are included in the label hash, guaranteeing unique runner matching per combination.
+2. **EC2 override labels (`ghr-ec2-<key>:<value>`)** — Labels prefixed with `ghr-ec2-` are parsed by the scale-up lambda to dynamically configure the EC2 launch request. For EC2 Fleet launches this can include instance type, vCPU/memory requirements, GPU/accelerator specs, EBS volumes, placement, and networking. For dedicated-host launches, only labels that map to `RunInstances` launch parameters are applied. This eliminates the need to create separate runner configurations for each hardware combination.
+
+#### How it works
+
+When `enable_dynamic_labels` is enabled, the webhook and scale-up lambdas inspect the `runs-on` labels of incoming `workflow_job` events. Labels starting with `ghr-ec2-` are parsed into an EC2 override configuration that is applied to the [CreateFleet](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateFleet.html) API call, or to supported [RunInstances](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_RunInstances.html) parameters when `use_dedicated_host = true`. All other `ghr-` prefixed labels are carried through as custom identity labels. A deterministic hash of **all** `ghr-` prefixed labels (both custom and EC2) is used to ensure consistent and unique runner matching.
+
+#### Configuration
+
+[!IMPORTANT]
+This change renames `ec2_dynamic_labels_policy` to `aws_dynamic_labels_policy`. Before upgrading, rename the
+root module input and rename `matcherConfig.ec2DynamicLabelsPolicy` to `matcherConfig.awsDynamicLabelsPolicy`
+in `runner_matcher_config` or `multi_runner_config`. Terraform object validation rejects the legacy attribute
+names.
+
+Deny-list, using `blocked_keys`/`restricted_keys` (unlisted keys are allowed):
+
+```hcl
+module "runners" {
+  source = "github-aws-runners/github-runners/aws"
+
+  ...
+  enable_dynamic_labels = true
+  aws_dynamic_labels_policy = {
+    blocked_keys = ["image-id", "subnet-id"]
+
+    restricted_keys = {
+      "instance-type" = {
+        allowed = ["m5.*", "c5.*"]
+        denied  = ["m5.metal"]
+      }
+
+      "ebs-volume-size" = {
+        max = 200
+      }
+    }
+  }
+  ...
+}
+```
+
+Allow-list, using `allowed_keys` (unlisted keys are rejected):
+
+```hcl
+module "runners" {
+  source = "github-aws-runners/github-runners/aws"
+
+  ...
+  enable_dynamic_labels = true
+  aws_dynamic_labels_policy = {
+    allowed_keys = ["instance-type", "ebs-volume-size"]
+
+    restricted_keys = {
+      "instance-type" = {
+        allowed = ["m5.*", "c5.*"]
+      }
+      "ebs-volume-size" = {
+        max = 200
+      }
+    }
+  }
+  ...
+}
+```
+
+The root module variable is named `aws_dynamic_labels_policy`. The webhook matcher config receives the same policy under `matcherConfig.awsDynamicLabelsPolicy`. If you configure `runner_matcher_config` or `multi_runner_config.matcherConfig` directly, use `awsDynamicLabelsPolicy` for this policy.
+
+The policy is evaluated by dynamic label key:
+
+1. If `allowed_keys` is set (non-empty), any key not listed there is rejected.
+2. Keys in `blocked_keys` are always rejected.
+3. Keys in `restricted_keys` are allowed only when their value passes the rule.
+4. A key not listed anywhere above is allowed.
+
+Use only one of `allowed_keys` or `blocked_keys` in the same policy, not both. Setting both is an error: `terraform plan`/`apply` will fail. If a policy with both somehow still reaches the dispatcher (for example, someone edited the SSM parameter by hand), it rejects every dynamic label instead of guessing which list to use.
+
+Policy keys use the dynamic label suffix, not the full label. For example, use `instance-type` for `ghr-ec2-instance-type`.
+
+#### Custom identity labels
+
+Any label matching `ghr-<key>:<value>` (where `<key>` does **not** start with `ec2-`) is a custom identity label. These labels have no effect on EC2 instance configuration but are included in the runner matching hash. Use them to:
+
+- Assign a **unique job identity** so each workflow run targets a dedicated runner (e.g., `ghr-job-id:abc123`).
+- Apply **team or cost-center restrictions** (e.g., `ghr-team:platform`, `ghr-cost-center:eng-42`).
+- Tag runners with **environment or deployment context** (e.g., `ghr-env:staging`, `ghr-region:us-west-2`).
+- Enforce **any custom constraint** that differentiates one runner request from another.
+
+```yaml
+jobs:
+  deploy:
+    runs-on:
+      - self-hosted
+      - linux
+      - ghr-team:platform
+      - ghr-env:staging
+      - ghr-job-id:${{ github.run_id }}
+```
+
+In the example above, the three `ghr-` labels produce a unique hash, ensuring this job is matched to a runner created specifically for this combination. No EC2 overrides are applied — the runner uses the default fleet configuration.
+
+#### EC2 override labels
+
+Labels using the format `ghr-ec2-<key>:<value>` override EC2 launch configuration. Values with multiple items use semicolon-separated lists, for example `ghr-ec2-cpu-manufacturers:intel;amd`. Comma is reserved as a runner label separator, so do not use comma inside dynamic `ghr-*` labels.
+
+For default EC2 Fleet launches (`use_dedicated_host = false`), labels in this section are parsed into the `CreateFleet` request. Basic fleet overrides, placement, and block device labels are sent as launch template overrides where EC2 Fleet accepts them. Instance requirement labels become `InstanceRequirements`; pricing labels set either the fleet override price (`ghr-ec2-max-price`) or instance requirement price preferences.
+
+When `use_dedicated_host = true`, runner instances are launched with `RunInstances` instead of EC2 Fleet. In this mode:
+
+- Labels marked `Yes` in the Dedicated host column are forwarded to `RunInstances`.
+- Labels marked `No` in the Dedicated host column are Fleet-only and are not applied.
+- Use `ghr-ec2-instance-type` to select a concrete instance type for dedicated hosts.
+
+##### Basic Fleet Overrides
+
+| Label                                | Description                | Example value    | EC2 Fleet | Dedicated host |
+| ------------------------------------ | -------------------------- | ---------------- | --------- | -------------- |
+| `ghr-ec2-instance-type:<type>`       | Set specific instance type | `c5.xlarge`      | Yes       | Yes            |
+| `ghr-ec2-capacity-type:<type>`       | Set the capacity type      | `on-demand`      | Yes       | No             |
+| `ghr-ec2-max-price:<price>`          | Set maximum spot price     | `0.10`           | Yes       | No             |
+| `ghr-ec2-subnet-id:<id>`             | Set subnet ID              | `subnet-abc123`  | Yes       | Yes            |
+| `ghr-ec2-availability-zone:<zone>`   | Set availability zone      | `us-east-1a`     | Yes       | Yes            |
+| `ghr-ec2-availability-zone-id:<id>`  | Set availability zone ID   | `use1-az1`       | Yes       | Yes            |
+| `ghr-ec2-weighted-capacity:<number>` | Set weighted capacity      | `2`              | Yes       | No             |
+| `ghr-ec2-priority:<number>`          | Set launch priority        | `1`              | Yes       | No             |
+| `ghr-ec2-image-id:<ami-id>`          | Override AMI ID            | `ami-0abcdef123` | Yes       | Yes            |
+
+##### Capacity type
+
+`ghr-ec2-capacity-type` selects spot or on-demand for the runner created for a job. It overrides `instance_target_capacity_type` of the runner configuration. Only `spot` and `on-demand` are accepted. Any other value is rejected and the job is not retried.
+
+- With `use_dedicated_host = true` the label is ignored, because `RunInstances` does not support spot. A `spot` value writes a warning to the log.
+- `ghr-ec2-max-price` only applies to spot. It is not passed to the fleet request when the capacity type is `on-demand`.
+- On-demand failover (`enable_on_demand_failover_for_errors`) follows the capacity type of the request. It applies to jobs that use spot and never to jobs that use on-demand.
+- Tags for spot requests are defined in the launch template, and only when the default capacity type is spot without on-demand failover. A spot request created for a job that overrides the capacity type in another configuration does not get these tags.
+
+To allow only spot, restrict the key in the dynamic labels policy:
+
+```hcl
+aws_dynamic_labels_policy = {
+  restricted_keys = {
+    "capacity-type" = {
+      allowed = ["spot"]
+    }
+  }
+}
+```
+
+##### Instance Requirements — vCPU & Memory
+
+| Label                                      | Description                     | Example value | EC2 Fleet | Dedicated host |
+| ------------------------------------------ | ------------------------------- | ------------- | --------- | -------------- |
+| `ghr-ec2-vcpu-count-min:<number>`          | Minimum vCPU count              | `4`           | Yes       | No             |
+| `ghr-ec2-vcpu-count-max:<number>`          | Maximum vCPU count              | `16`          | Yes       | No             |
+| `ghr-ec2-memory-mib-min:<number>`          | Minimum memory in MiB           | `16384`       | Yes       | No             |
+| `ghr-ec2-memory-mib-max:<number>`          | Maximum memory in MiB           | `65536`       | Yes       | No             |
+| `ghr-ec2-memory-gib-per-vcpu-min:<number>` | Min memory per vCPU ratio (GiB) | `2`           | Yes       | No             |
+| `ghr-ec2-memory-gib-per-vcpu-max:<number>` | Max memory per vCPU ratio (GiB) | `8`           | Yes       | No             |
+
+##### Instance Requirements — CPU & Performance
+
+| Label                                    | Description                                                                    | Example value          | EC2 Fleet | Dedicated host |
+| ---------------------------------------- | ------------------------------------------------------------------------------ | ---------------------- | --------- | -------------- |
+| `ghr-ec2-cpu-manufacturers:<list>`       | CPU manufacturers (semicolon-separated: `intel`, `amd`, `amazon-web-services`) | `intel;amd`            | Yes       | No             |
+| `ghr-ec2-instance-generations:<list>`    | Instance generations (semicolon-separated)                                     | `current`              | Yes       | No             |
+| `ghr-ec2-excluded-instance-types:<list>` | Exclude instance types (semicolon-separated)                                   | `t2.micro;t3.nano`     | Yes       | No             |
+| `ghr-ec2-allowed-instance-types:<list>`  | Allow only specific instance types (semicolon-separated)                       | `c5.xlarge;c5.2xlarge` | Yes       | No             |
+| `ghr-ec2-burstable-performance:<value>`  | Burstable performance (`included`, `excluded`, `required`)                     | `excluded`             | Yes       | No             |
+| `ghr-ec2-bare-metal:<value>`             | Bare metal (`included`, `excluded`, `required`)                                | `excluded`             | Yes       | No             |
+
+##### Instance Requirements — Accelerators / GPU
+
+| Label                                               | Description                                                                                       | Example value | EC2 Fleet | Dedicated host |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------- | --------- | -------------- |
+| `ghr-ec2-accelerator-types:<list>`                  | Accelerator types (semicolon-separated: `gpu`, `fpga`, `inference`)                               | `gpu`         | Yes       | No             |
+| `ghr-ec2-accelerator-count-min:<number>`            | Minimum accelerator count                                                                         | `1`           | Yes       | No             |
+| `ghr-ec2-accelerator-count-max:<number>`            | Maximum accelerator count                                                                         | `4`           | Yes       | No             |
+| `ghr-ec2-accelerator-manufacturers:<list>`          | Accelerator manufacturers (semicolon-separated: `nvidia`, `amd`, `amazon-web-services`, `xilinx`) | `nvidia`      | Yes       | No             |
+| `ghr-ec2-accelerator-names:<list>`                  | Specific accelerator names (semicolon-separated)                                                  | `t4;v100`     | Yes       | No             |
+| `ghr-ec2-accelerator-total-memory-mib-min:<number>` | Min accelerator total memory in MiB                                                               | `8192`        | Yes       | No             |
+| `ghr-ec2-accelerator-total-memory-mib-max:<number>` | Max accelerator total memory in MiB                                                               | `32768`       | Yes       | No             |
+
+##### Instance Requirements — Network & Storage
+
+| Label                                              | Description                                             | Example value | EC2 Fleet | Dedicated host |
+| -------------------------------------------------- | ------------------------------------------------------- | ------------- | --------- | -------------- |
+| `ghr-ec2-network-interface-count-min:<number>`     | Min network interfaces                                  | `1`           | Yes       | No             |
+| `ghr-ec2-network-interface-count-max:<number>`     | Max network interfaces                                  | `4`           | Yes       | No             |
+| `ghr-ec2-network-bandwidth-gbps-min:<number>`      | Min network bandwidth in Gbps                           | `10`          | Yes       | No             |
+| `ghr-ec2-network-bandwidth-gbps-max:<number>`      | Max network bandwidth in Gbps                           | `25`          | Yes       | No             |
+| `ghr-ec2-local-storage:<value>`                    | Local storage (`included`, `excluded`, `required`)      | `required`    | Yes       | No             |
+| `ghr-ec2-local-storage-types:<list>`               | Local storage types (semicolon-separated: `hdd`, `ssd`) | `ssd`         | Yes       | No             |
+| `ghr-ec2-total-local-storage-gb-min:<number>`      | Min total local storage in GB                           | `100`         | Yes       | No             |
+| `ghr-ec2-total-local-storage-gb-max:<number>`      | Max total local storage in GB                           | `500`         | Yes       | No             |
+| `ghr-ec2-baseline-ebs-bandwidth-mbps-min:<number>` | Min baseline EBS bandwidth in Mbps                      | `1000`        | Yes       | No             |
+| `ghr-ec2-baseline-ebs-bandwidth-mbps-max:<number>` | Max baseline EBS bandwidth in Mbps                      | `5000`        | Yes       | No             |
+
+##### Placement
+
+| Label                                             | Description                              | Example value      | EC2 Fleet | Dedicated host |
+| ------------------------------------------------- | ---------------------------------------- | ------------------ | --------- | -------------- |
+| `ghr-ec2-placement-group-name:<name>`             | Placement group name                     | `my-cluster-group` | Yes       | Yes            |
+| `ghr-ec2-placement-group-id:<id>`                 | Placement group ID                       | `pg-abc123`        | Yes       | Yes            |
+| `ghr-ec2-placement-tenancy:<value>`               | Tenancy (`default`, `dedicated`, `host`) | `dedicated`        | Yes       | Yes            |
+| `ghr-ec2-placement-host-id:<id>`                  | Dedicated host ID                        | `h-abc123`         | Yes       | Yes            |
+| `ghr-ec2-placement-affinity:<value>`              | Affinity (`default`, `host`)             | `host`             | Yes       | Yes            |
+| `ghr-ec2-placement-partition-number:<number>`     | Partition number                         | `1`                | Yes       | Yes            |
+| `ghr-ec2-placement-availability-zone:<zone>`      | Placement availability zone              | `us-east-1a`       | Yes       | Yes            |
+| `ghr-ec2-placement-availability-zone-id:<id>`     | Placement availability zone ID           | `use1-az1`         | Yes       | Yes            |
+| `ghr-ec2-placement-spread-domain:<domain>`        | Spread domain                            | `my-domain`        | Yes       | Yes            |
+| `ghr-ec2-placement-host-resource-group-arn:<arn>` | Host resource group ARN                  | `arn:aws:...`      | Yes       | Yes            |
+
+##### Block Device Mappings (EBS)
+
+| Label                                         | Description                                                | Example value | EC2 Fleet | Dedicated host |
+| --------------------------------------------- | ---------------------------------------------------------- | ------------- | --------- | -------------- |
+| `ghr-ec2-block-device-name:<name>`            | Block device name                                          | `/dev/sda1`   | Yes       | Yes            |
+| `ghr-ec2-ebs-volume-size:<size>`              | EBS volume size in GB                                      | `100`         | Yes       | Yes            |
+| `ghr-ec2-ebs-volume-type:<type>`              | EBS volume type (`gp2`, `gp3`, `io1`, `io2`, `st1`, `sc1`) | `gp3`         | Yes       | Yes            |
+| `ghr-ec2-ebs-iops:<number>`                   | EBS IOPS                                                   | `3000`        | Yes       | Yes            |
+| `ghr-ec2-ebs-throughput:<number>`             | EBS throughput in MB/s (gp3 only)                          | `125`         | Yes       | Yes            |
+| `ghr-ec2-ebs-encrypted:<boolean>`             | EBS encryption (`true`, `false`)                           | `true`        | Yes       | Yes            |
+| `ghr-ec2-ebs-kms-key-id:<id>`                 | KMS key ID for encryption                                  | `key-abc123`  | Yes       | Yes            |
+| `ghr-ec2-ebs-delete-on-termination:<boolean>` | Delete on termination (`true`, `false`)                    | `true`        | Yes       | Yes            |
+| `ghr-ec2-ebs-snapshot-id:<id>`                | Snapshot ID for EBS volume                                 | `snap-abc123` | Yes       | Yes            |
+| `ghr-ec2-block-device-virtual-name:<name>`    | Virtual device name (ephemeral storage)                    | `ephemeral0`  | Yes       | Yes            |
+| `ghr-ec2-block-device-no-device:<string>`     | Suppresses device mapping                                  | `true`        | Yes       | Yes            |
+
+##### Pricing & Advanced
+
+| Label                                                                      | Description                                                       | Example value | EC2 Fleet | Dedicated host |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------- | ------------- | --------- | -------------- |
+| `ghr-ec2-spot-max-price-percentage-over-lowest-price:<number>`             | Spot max price as % over lowest price                             | `20`          | Yes       | No             |
+| `ghr-ec2-on-demand-max-price-percentage-over-lowest-price:<number>`        | On-demand max price as % over lowest price                        | `10`          | Yes       | No             |
+| `ghr-ec2-max-spot-price-as-percentage-of-optimal-on-demand-price:<number>` | Max spot price as % of optimal on-demand                          | `50`          | Yes       | No             |
+| `ghr-ec2-require-hibernate-support:<boolean>`                              | Require hibernate support (`true`, `false`)                       | `true`        | Yes       | No             |
+| `ghr-ec2-require-encryption-in-transit:<boolean>`                          | Require encryption in-transit (`true`, `false`)                   | `true`        | Yes       | No             |
+| `ghr-ec2-baseline-performance-factors-cpu-reference-families:<list>`       | CPU baseline performance reference families (semicolon-separated) | `c5;m5`       | Yes       | No             |
+
+#### Examples
+
+Custom identity labels only — unique runner per job run:
+
+```yaml
+jobs:
+  deploy:
+    runs-on:
+      - self-hosted
+      - linux
+      - ghr-job-id:${{ github.run_id }}
+```
+
+Specific instance type with a larger EBS volume:
+
+```yaml
+jobs:
+  build:
+    runs-on:
+      - self-hosted
+      - linux
+      - ghr-ec2-instance-type:c5.2xlarge
+      - ghr-ec2-ebs-volume-size:200
+      - ghr-ec2-ebs-volume-type:gp3
+```
+
+Attribute-based instance selection with Intel or AMD CPUs:
+
+```yaml
+jobs:
+  test:
+    runs-on:
+      - self-hosted
+      - linux
+      - ghr-ec2-vcpu-count-min:2
+      - ghr-ec2-vcpu-count-max:8
+      - ghr-ec2-memory-mib-min:8192
+      - ghr-ec2-cpu-manufacturers:intel;amd
+      - ghr-ec2-burstable-performance:excluded
+```
+
+#### Considerations
+
+- This feature requires `enable_dynamic_labels = true` in your Terraform configuration.
+- When using `ghr-ec2-instance-type`, the fleet request uses a direct instance type override. When using `ghr-ec2-vcpu-count-*`, `ghr-ec2-memory-mib-*`, or other instance requirement labels, the fleet request uses [attribute-based instance type selection](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-fleet-attribute-based-instance-type-selection.html).
+- Labels are parsed at the scale-up lambda level — they do not change after the instance is launched.
+- A deterministic hash of all `ghr-` prefixed labels (both custom identity and EC2 override) is used for runner matching. Different label combinations produce different hashes, ensuring each unique set of requirements gets its own runner.
+- Dynamic `ghr-` labels can contain letters, numbers, `.`, `_`, `/`, `-`, `:`, and `;`. Comma is not allowed because it is reserved as a runner label separator.
+- GitHub runner labels are copied to EC2 as comma-separated values in `ghr:runner_labels` tags, capped at five label tags (`ghr:runner_labels` through `ghr:runner_labels:5`) to avoid consuming too many of the EC2 50 tags per resource. The comma-separated label value is split across those EC2 tags when it exceeds the tag value length limit.
+- Multiple EBS labels apply to the same (first) block device mapping. If you need more complex block device configurations, use a custom AMI or launch template instead.
+- This feature is compatible with both org-level and repo-level runners, spot and on-demand instances, and ephemeral and non-ephemeral runners.
+- Be mindful of the security implications: enabling this feature allows workflow authors to influence EC2 instance configuration via `ghr-ec2-` labels. Ensure your IAM policies and subnet configurations provide appropriate guardrails.
 
 ### EventBridge
 

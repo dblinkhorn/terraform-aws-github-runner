@@ -27,6 +27,11 @@ variable "config" {
     github_app_parameters = object({
       key_base64 = map(string)
       id         = map(string)
+      additional_apps_manifest = optional(object({
+        name = string
+        arn  = string
+      }), null)
+      additional_app_parameter_arns = optional(list(string), [])
     })
     subnet_ids = list(string)
     runner = object({
@@ -46,8 +51,11 @@ variable "config" {
       role = object({
         arn = string
       })
+      use_dedicated_host = bool
     })
+    runners_maximum_count         = number
     instance_types                = list(string)
+    instance_type_priorities      = optional(map(number))
     instance_target_capacity_type = string
     instance_allocation_strategy  = string
     instance_max_spot_price       = string
@@ -57,12 +65,16 @@ variable "config" {
       schedule_expression_timezone = string
       size                         = number
     }))
-    role_permissions_boundary            = string
-    kms_key_arn                          = string
-    ami_kms_key_arn                      = string
-    ami_id_ssm_parameter_arn             = string
-    role_path                            = string
-    ssm_token_path                       = string
+    include_busy_runners      = bool
+    role_permissions_boundary = string
+    kms_key_arn               = string
+    ami_kms_key_arn           = string
+    ami_id_ssm_parameter_arn  = string
+    role_path                 = string
+    ssm_token_path            = string
+    ssm_ttl_seconds = optional(object({
+      tokens = optional(number, null)
+    }), {})
     ssm_config_path                      = string
     ami_id_ssm_parameter_name            = string
     ami_id_ssm_parameter_read_policy_arn = string

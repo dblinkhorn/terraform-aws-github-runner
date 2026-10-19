@@ -1,95 +1,60 @@
-import { Octokit } from '@octokit/rest';
-import moment from 'moment-timezone';
-import * as nock from 'nock';
+import type { Octokit } from '@octokit/rest';
+import { defaultComputeProvider } from '@aws-github-runner/compute-providers/provider-types';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { listEC2Runners } from '../aws/runners';
 import * as ghAuth from '../github/auth';
-import { createRunners, getGitHubEnterpriseApiUrl } from '../scale-runners/scale-up';
+import { controlPlaneProviderRegistry } from '../control-plane-providers';
+import * as githubRunner from '../scale-runners/github-runner';
 import { adjust } from './pool';
-import { describe, it, expect, beforeEach, vi, MockedClass } from 'vitest';
+import type { PoolComputeProvider } from './pool-provider';
 
-const mockOctokit = {
+const githubClient = {
   paginate: vi.fn(),
-  checks: { get: vi.fn() },
   actions: {
-    createRegistrationTokenForOrg: vi.fn(),
+    listSelfHostedRunnersForOrg: vi.fn(),
   },
   apps: {
     getOrgInstallation: vi.fn(),
   },
 };
 
-vi.mock('@octokit/rest', () => ({
-  Octokit: vi.fn().mockImplementation(function () {
-    return mockOctokit;
-  }),
-}));
-
-vi.mock('./../aws/runners', async () => ({
-  listEC2Runners: vi.fn(),
-  // Include any other functions from the module that might be used
-  bootTimeExceeded: vi.fn(),
-}));
-vi.mock('./../github/auth', async () => ({
+vi.mock('../github/auth', () => ({
   createGithubAppAuth: vi.fn(),
   createGithubInstallationAuth: vi.fn(),
   createOctokitClient: vi.fn(),
+  getStoredInstallationId: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../scale-runners/scale-up', async () => ({
-  scaleUp: vi.fn(),
-  createRunners: vi.fn(),
+vi.mock('../scale-runners/github-runner', () => ({
+  createStartRunnerConfig: vi.fn(),
   getGitHubEnterpriseApiUrl: vi.fn().mockReturnValue({
     ghesApiUrl: '',
     ghesBaseUrl: '',
   }),
-  // Include any other functions that might be needed
 }));
 
-const mocktokit = Octokit as MockedClass<typeof Octokit>;
 const mockedAppAuth = vi.mocked(ghAuth.createGithubAppAuth);
 const mockedInstallationAuth = vi.mocked(ghAuth.createGithubInstallationAuth);
-const mockCreateClient = vi.mocked(ghAuth.createOctokitClient);
-const mockListRunners = vi.mocked(listEC2Runners);
+const mockedCreateClient = vi.mocked(ghAuth.createOctokitClient);
+const mockedResolveCapability = vi.spyOn(controlPlaneProviderRegistry, 'capability');
+const mockedGetGitHubEnterpriseApiUrl = vi.mocked(githubRunner.getGitHubEnterpriseApiUrl);
+
+const poolProvider = {
+  listRunners: vi.fn<PoolComputeProvider['listRunners']>(),
+  countAvailableRunners: vi.fn<PoolComputeProvider['countAvailableRunners']>(),
+  createRunners: vi.fn<PoolComputeProvider['createRunners']>(),
+} satisfies Omit<PoolComputeProvider, 'type'>;
 
 const cleanEnv = process.env;
 
 const ORG = 'my-org';
-const MINIMUM_TIME_RUNNING = 15;
 
-const ec2InstancesRegistered = [
-  {
-    instanceId: 'i-1-idle',
-    launchTime: new Date(),
-    type: 'Org',
-    owner: ORG,
-  },
-  {
-    instanceId: 'i-2-busy',
-    launchTime: new Date(),
-    type: 'Org',
-    owner: ORG,
-  },
-  {
-    instanceId: 'i-3-offline',
-    launchTime: new Date(),
-    type: 'Org',
-    owner: ORG,
-  },
-  {
-    instanceId: 'i-4-idle-older-than-minimum-time-running',
-    launchTime: moment(new Date())
-      .subtract(MINIMUM_TIME_RUNNING + 3, 'minutes')
-      .toDate(),
-    type: 'Org',
-    owner: ORG,
-  },
-];
+const providerRunners = [{ id: 'runner-1' }, { id: 'runner-2' }, { id: 'runner-3' }, { id: 'runner-4' }];
 
 const githubRunnersRegistered = [
   {
     id: 1,
-    name: 'i-1-idle',
+    name: 'runner-1',
     os: 'linux',
     status: 'online',
     busy: false,
@@ -97,7 +62,7 @@ const githubRunnersRegistered = [
   },
   {
     id: 2,
-    name: 'i-2-busy',
+    name: 'runner-2',
     os: 'linux',
     status: 'online',
     busy: true,
@@ -105,15 +70,15 @@ const githubRunnersRegistered = [
   },
   {
     id: 3,
-    name: 'i-3-offline',
+    name: 'runner-3',
     os: 'linux',
     status: 'offline',
     busy: false,
     labels: [],
   },
   {
-    id: 3,
-    name: 'i-4-idle-older-than-minimum-time-running',
+    id: 4,
+    name: 'runner-4',
     os: 'linux',
     status: 'online',
     busy: false,
@@ -122,50 +87,31 @@ const githubRunnersRegistered = [
 ];
 
 beforeEach(() => {
-  nock.disableNetConnect();
-  vi.resetModules();
   vi.clearAllMocks();
   process.env = { ...cleanEnv };
-  process.env.GITHUB_APP_KEY_BASE64 = 'TEST_CERTIFICATE_DATA';
-  process.env.GITHUB_APP_ID = '1337';
-  process.env.GITHUB_APP_CLIENT_ID = 'TEST_CLIENT_ID';
-  process.env.GITHUB_APP_CLIENT_SECRET = 'TEST_CLIENT_SECRET';
-  process.env.RUNNERS_MAXIMUM_COUNT = '3';
+  process.env.RUNNERS_MAXIMUM_COUNT = '-1';
   process.env.ENVIRONMENT = 'unit-test-environment';
-  process.env.ENABLE_ORGANIZATION_RUNNERS = 'true';
-  process.env.LAUNCH_TEMPLATE_NAME = 'lt-1';
-  process.env.SUBNET_IDS = 'subnet-123';
   process.env.SSM_TOKEN_PATH = '/github-action-runners/default/runners/tokens';
-  process.env.INSTANCE_TYPES = 'm5.large';
-  process.env.INSTANCE_TARGET_CAPACITY_TYPE = 'spot';
+  process.env.SSM_CONFIG_PATH = '/github-action-runners/default/runners/config';
+  process.env.PARAMETER_GITHUB_APP_ID_NAME = 'github-app-id';
+  process.env.PARAMETER_GITHUB_APP_KEY_BASE64_NAME = 'github-app-key';
   process.env.RUNNER_OWNER = ORG;
-  process.env.RUNNER_BOOT_TIME_IN_MINUTES = MINIMUM_TIME_RUNNING.toString();
-  process.env.SCALE_ERRORS =
-    '["UnfulfillableCapacity","MaxSpotInstanceCountExceeded","TargetCapacityLimitExceededException"]';
 
-  const mockTokenReturnValue = {
-    data: {
-      token: '1234abcd',
-    },
-  };
-  mockOctokit.actions.createRegistrationTokenForOrg.mockImplementation(() => mockTokenReturnValue);
+  githubClient.paginate.mockResolvedValue(githubRunnersRegistered);
+  githubClient.apps.getOrgInstallation.mockResolvedValue({ data: { id: 1 } });
+  mockedGetGitHubEnterpriseApiUrl.mockReturnValue({ ghesApiUrl: '', ghesBaseUrl: '' });
 
-  mockOctokit.paginate.mockImplementation(() => githubRunnersRegistered);
-
-  mockListRunners.mockImplementation(async () => ec2InstancesRegistered);
-
-  const mockInstallationIdReturnValueOrgs = {
-    data: {
-      id: 1,
-    },
-  };
-  mockOctokit.apps.getOrgInstallation.mockImplementation(() => mockInstallationIdReturnValueOrgs);
+  mockedResolveCapability.mockReturnValue(() => poolProvider);
+  poolProvider.listRunners.mockResolvedValue(providerRunners);
+  poolProvider.countAvailableRunners.mockReturnValue(2);
+  poolProvider.createRunners.mockResolvedValue([]);
 
   mockedAppAuth.mockResolvedValue({
     type: 'app',
     token: 'token',
     appId: 1,
     expiresAt: 'some-date',
+    appIndex: 0,
   });
   mockedInstallationAuth.mockResolvedValue({
     type: 'token',
@@ -178,112 +124,93 @@ beforeEach(() => {
     installationId: 0,
   });
 
-  mockCreateClient.mockResolvedValue(new mocktokit());
+  mockedCreateClient.mockResolvedValue(githubClient as unknown as Octokit);
 });
 
-describe('Test simple pool.', () => {
+describe('pool adjustment', () => {
   describe('With GitHub Cloud', () => {
     beforeEach(() => {
-      (getGitHubEnterpriseApiUrl as ReturnType<typeof vi.fn>).mockReturnValue({
+      mockedGetGitHubEnterpriseApiUrl.mockReturnValue({
         ghesApiUrl: '',
         ghesBaseUrl: '',
       });
     });
-    it('Top up pool with pool size 2 registered.', async () => {
+
+    it('tops up the pool to the requested size', async () => {
       await adjust({ poolSize: 3 });
-      expect(createRunners).toHaveBeenCalledTimes(1);
-      expect(createRunners).toHaveBeenCalledWith(expect.anything(), expect.anything(), 1, expect.anything());
+
+      expect(poolProvider.createRunners).toHaveBeenCalledTimes(1);
+      expect(poolProvider.createRunners).toHaveBeenCalledWith(expect.objectContaining({ numberOfRunners: 1 }));
     });
 
-    it('Should not top up if pool size is reached.', async () => {
+    it('uses the default provider for events without a provider type', async () => {
+      await adjust({ poolSize: 10 });
+
+      expect(mockedResolveCapability).toHaveBeenCalledWith(defaultComputeProvider, 'pool');
+      expect(poolProvider.listRunners).toHaveBeenCalledWith({
+        environment: 'unit-test-environment',
+        runnerOwner: ORG,
+        runnerType: 'Org',
+      });
+      expect(poolProvider.createRunners).toHaveBeenCalledWith(expect.objectContaining({ numberOfRunners: 8 }));
+    });
+
+    it('rejects unsupported provider types', async () => {
+      await expect(adjust({ poolSize: 10, type: 'unsupported-provider' })).rejects.toThrow(
+        "Unsupported compute provider type 'unsupported-provider'",
+      );
+
+      expect(poolProvider.listRunners).not.toHaveBeenCalled();
+    });
+
+    it('does not top up when the requested size is already available', async () => {
       await adjust({ poolSize: 1 });
-      expect(createRunners).not.toHaveBeenCalled();
-    });
 
-    it('Should top up if pool size is not reached including a booting instance.', async () => {
-      mockListRunners.mockImplementation(async () => [
-        ...ec2InstancesRegistered,
-        {
-          instanceId: 'i-4-still-booting',
-          launchTime: moment(new Date())
-            .subtract(MINIMUM_TIME_RUNNING - 3, 'minutes')
-            .toDate(),
-          type: 'Org',
-          owner: ORG,
-        },
-        {
-          instanceId: 'i-5-orphan',
-          launchTime: moment(new Date())
-            .subtract(MINIMUM_TIME_RUNNING + 3, 'minutes')
-            .toDate(),
-          type: 'Org',
-          owner: ORG,
-        },
-      ]);
-
-      // 2 idle + 1 booting = 3, top up with 2 to match a pool of 5
-      await adjust({ poolSize: 5 });
-      expect(createRunners).toHaveBeenCalled();
-      // Access the numberOfRunners without assuming a specific position
-      // Just test that the function was called
-      expect(createRunners).toHaveBeenCalled();
-      // With TypeScript we can't directly access mock.calls, so we'll just verify the function was called
-      // The number of runners should be correct, but we can't type-check this easily
-    });
-
-    it('Should not top up if pool size is reached including a booting instance.', async () => {
-      mockListRunners.mockImplementation(async () => [
-        ...ec2InstancesRegistered,
-        {
-          instanceId: 'i-4-still-booting',
-          launchTime: moment(new Date())
-            .subtract(MINIMUM_TIME_RUNNING - 3, 'minutes')
-            .toDate(),
-          type: 'Org',
-          owner: ORG,
-        },
-        {
-          instanceId: 'i-5-orphan',
-          launchTime: moment(new Date())
-            .subtract(MINIMUM_TIME_RUNNING + 3, 'minutes')
-            .toDate(),
-          type: 'Org',
-          owner: ORG,
-        },
-      ]);
-
-      await adjust({ poolSize: 2 });
-      expect(createRunners).not.toHaveBeenCalled();
+      expect(poolProvider.createRunners).not.toHaveBeenCalled();
     });
   });
 
   describe('With GHES', () => {
     beforeEach(() => {
-      (getGitHubEnterpriseApiUrl as ReturnType<typeof vi.fn>).mockReturnValue({
+      mockedGetGitHubEnterpriseApiUrl.mockReturnValue({
         ghesApiUrl: 'https://api.github.enterprise.something',
         ghesBaseUrl: 'https://github.enterprise.something',
       });
     });
 
-    it('Top up if the pool size is set to 5', async () => {
+    it('passes the enterprise base URL when creating runners', async () => {
       await adjust({ poolSize: 5 });
-      // 2 idle, top up with 3 to match a pool of 5
-      expect(createRunners).toHaveBeenCalledWith(expect.anything(), expect.anything(), 3, expect.anything());
+
+      expect(poolProvider.createRunners).toHaveBeenCalledWith(
+        expect.objectContaining({
+          githubRunnerConfig: expect.objectContaining({
+            ghesBaseUrl: 'https://github.enterprise.something',
+          }),
+          numberOfRunners: 3,
+        }),
+      );
     });
   });
 
-  describe('With Github Data Residency', () => {
+  describe('With GitHub Data Residency', () => {
     beforeEach(() => {
-      (getGitHubEnterpriseApiUrl as ReturnType<typeof vi.fn>).mockReturnValue({
+      mockedGetGitHubEnterpriseApiUrl.mockReturnValue({
         ghesApiUrl: 'https://api.companyname.ghe.com',
         ghesBaseUrl: 'https://companyname.ghe.com',
       });
     });
 
-    it('Top up if the pool size is set to 5', async () => {
+    it('passes the data-residency base URL when creating runners', async () => {
       await adjust({ poolSize: 5 });
-      // 2 idle, top up with 3 to match a pool of 5
-      expect(createRunners).toHaveBeenCalledWith(expect.anything(), expect.anything(), 3, expect.anything());
+
+      expect(poolProvider.createRunners).toHaveBeenCalledWith(
+        expect.objectContaining({
+          githubRunnerConfig: expect.objectContaining({
+            ghesBaseUrl: 'https://companyname.ghe.com',
+          }),
+          numberOfRunners: 3,
+        }),
+      );
     });
   });
 
@@ -292,48 +219,151 @@ describe('Test simple pool.', () => {
       process.env.RUNNER_NAME_PREFIX = 'runner-prefix_';
     });
 
-    it('Should top up with fewer runners when there are idle prefixed runners', async () => {
-      // Add prefixed runners to github
-      mockOctokit.paginate.mockImplementation(async () => [
+    it('removes the prefix from runner names before passing statuses to the provider', async () => {
+      githubClient.paginate.mockResolvedValue([
         ...githubRunnersRegistered,
         {
           id: 5,
-          name: 'runner-prefix_i-5-idle',
-          os: 'linux',
-          status: 'online',
-          busy: false,
-          labels: [],
-        },
-        {
-          id: 6,
-          name: 'runner-prefix_i-6-idle',
+          name: 'runner-prefix_runner-5',
           os: 'linux',
           status: 'online',
           busy: false,
           labels: [],
         },
       ]);
-
-      // Add instances in ec2
-      mockListRunners.mockImplementation(async () => [
-        ...ec2InstancesRegistered,
-        {
-          instanceId: 'i-5-idle',
-          launchTime: new Date(),
-          type: 'Org',
-          owner: ORG,
-        },
-        {
-          instanceId: 'i-6-idle',
-          launchTime: new Date(),
-          type: 'Org',
-          owner: ORG,
-        },
-      ]);
+      poolProvider.countAvailableRunners.mockReturnValue(4);
 
       await adjust({ poolSize: 5 });
-      // 2 idle, 2 prefixed idle top up with 1 to match a pool of 5
-      expect(createRunners).toHaveBeenCalledWith(expect.anything(), expect.anything(), 1, expect.anything());
+
+      expect(poolProvider.countAvailableRunners).toHaveBeenCalledWith(providerRunners, expect.any(Map), false);
+      const runnerStatuses = poolProvider.countAvailableRunners.mock.calls[0][1];
+      expect(runnerStatuses.get('runner-5')).toEqual({ busy: false, status: 'online' });
+      expect(runnerStatuses.has('runner-prefix_runner-5')).toBe(false);
+      expect(poolProvider.createRunners).toHaveBeenCalledWith(expect.objectContaining({ numberOfRunners: 1 }));
+    });
+  });
+
+  describe('Respecting runners_maximum_count', () => {
+    beforeEach(() => {
+      mockedGetGitHubEnterpriseApiUrl.mockReturnValue({
+        ghesApiUrl: '',
+        ghesBaseUrl: '',
+      });
+    });
+
+    it('does not top up when the total number of runners is at the maximum', async () => {
+      process.env.RUNNERS_MAXIMUM_COUNT = '4';
+      await adjust({ poolSize: 10 });
+
+      expect(poolProvider.createRunners).not.toHaveBeenCalled();
+    });
+
+    it('does not top up when the total number of runners exceeds the maximum', async () => {
+      process.env.RUNNERS_MAXIMUM_COUNT = '3';
+      await adjust({ poolSize: 10 });
+
+      expect(poolProvider.createRunners).not.toHaveBeenCalled();
+    });
+
+    it('clamps the top-up to the remaining headroom under the maximum', async () => {
+      process.env.RUNNERS_MAXIMUM_COUNT = '6';
+      await adjust({ poolSize: 10 });
+
+      expect(poolProvider.createRunners).toHaveBeenCalledWith(expect.objectContaining({ numberOfRunners: 2 }));
+    });
+
+    it('tops up against the pool size when below the maximum headroom', async () => {
+      process.env.RUNNERS_MAXIMUM_COUNT = '6';
+      await adjust({ poolSize: 3 });
+
+      expect(poolProvider.createRunners).toHaveBeenCalledWith(expect.objectContaining({ numberOfRunners: 1 }));
+    });
+
+    it('ignores the maximum when set to -1', async () => {
+      process.env.RUNNERS_MAXIMUM_COUNT = '-1';
+      await adjust({ poolSize: 10 });
+
+      expect(poolProvider.createRunners).toHaveBeenCalledWith(expect.objectContaining({ numberOfRunners: 8 }));
+    });
+  });
+
+  describe('With INCLUDE_BUSY_RUNNERS enabled', () => {
+    beforeEach(() => {
+      process.env.INCLUDE_BUSY_RUNNERS = 'true';
+      poolProvider.countAvailableRunners.mockReturnValue(3);
+    });
+
+    it('does not top up when the provider reports that the requested size is available', async () => {
+      await adjust({ poolSize: 3 });
+
+      expect(poolProvider.countAvailableRunners).toHaveBeenCalledWith(providerRunners, expect.any(Map), true);
+      expect(poolProvider.createRunners).not.toHaveBeenCalled();
+    });
+
+    it('tops up from the provider count that includes busy runners', async () => {
+      await adjust({ poolSize: 5 });
+
+      expect(poolProvider.countAvailableRunners).toHaveBeenCalledWith(providerRunners, expect.any(Map), true);
+      expect(poolProvider.createRunners).toHaveBeenCalledWith(expect.objectContaining({ numberOfRunners: 2 }));
+    });
+  });
+
+  describe('Multi-app round-robin', () => {
+    beforeEach(() => {
+      mockedGetGitHubEnterpriseApiUrl.mockReturnValue({
+        ghesApiUrl: '',
+        ghesBaseUrl: '',
+      });
+    });
+
+    it('passes the same appIndex to createGithubInstallationAuth', async () => {
+      mockedAppAuth.mockResolvedValue({
+        type: 'app',
+        token: 'token',
+        appId: 42,
+        expiresAt: 'some-date',
+        appIndex: 1,
+      });
+
+      await adjust({ poolSize: 3 });
+
+      expect(mockedInstallationAuth).toHaveBeenCalledWith(expect.any(Number), expect.any(String), 1, expect.anything());
+    });
+
+    it('looks up installationId using the selected app JWT', async () => {
+      mockedAppAuth.mockResolvedValue({
+        type: 'app',
+        token: 'app-token-for-selected-app',
+        appId: 42,
+        expiresAt: 'some-date',
+        appIndex: 1,
+      });
+
+      await adjust({ poolSize: 3 });
+
+      expect(githubClient.apps.getOrgInstallation).toHaveBeenCalledWith({ org: ORG });
+    });
+
+    it('passes appIndex to the provider so rate-limit metrics use the selected app', async () => {
+      mockedAppAuth.mockResolvedValue({
+        type: 'app',
+        token: 'token',
+        appId: 42,
+        expiresAt: 'some-date',
+        appIndex: 2,
+      });
+
+      await adjust({ poolSize: 3 });
+
+      expect(poolProvider.createRunners).toHaveBeenCalledWith(
+        expect.objectContaining({
+          githubRunnerConfig: expect.objectContaining({ appIndex: 2 }),
+        }),
+      );
     });
   });
 });
+
+vi.mock('../github/app-failover', () => ({
+  withAppFailover: async (index: number, create: (index: number) => Promise<unknown>) => create(index),
+}));

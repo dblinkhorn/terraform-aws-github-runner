@@ -20,21 +20,25 @@ locals {
   default_ami = {
     "windows" = { name = ["Windows_Server-2022-English-Full-ECS_Optimized-*"] }
     "linux"   = var.runner_architecture == "arm64" ? { name = ["al2023-ami-2023.*-kernel-6.*-arm64"] } : { name = ["al2023-ami-2023.*-kernel-6.*-x86_64"] }
+    "osx"     = var.runner_architecture == "arm64" ? { name = ["amzn-ec2-macos-15.*-arm64"] } : { name = ["amzn-ec2-macos-15.*"] }
   }
 
   default_userdata_template = {
     "windows" = "${path.module}/templates/user-data.ps1"
     "linux"   = "${path.module}/templates/user-data.sh"
+    "osx"     = "${path.module}/templates/user-data-osx.sh"
   }
 
   userdata_install_runner = {
     "windows" = "${path.module}/templates/install-runner.ps1"
     "linux"   = "${path.module}/templates/install-runner.sh"
+    "osx"     = "${path.module}/templates/install-runner-osx.sh"
   }
 
   userdata_start_runner = {
     "windows" = "${path.module}/templates/start-runner.ps1"
     "linux"   = "${path.module}/templates/start-runner.sh"
+    "osx"     = "${path.module}/templates/start-runner-osx.sh"
   }
 
   # Handle AMI configuration
@@ -78,6 +82,13 @@ locals {
     enable_cloudwatch_agent         = var.enable_cloudwatch_agent
     ssm_key_cloudwatch_agent_config = var.enable_cloudwatch_agent ? aws_ssm_parameter.cloudwatch_agent_config_runner[0].name : ""
   }) : var.userdata_content) : ""
+
+  encoded_user_data = (
+    var.runner_os == "linux" ? base64gzip(local.user_data) :
+    var.runner_os == "windows" ? base64encode(local.user_data) :
+    var.runner_os == "osx" ? base64encode(local.user_data) :
+    null
+  )
 }
 
 data "aws_ami" "runner" {
@@ -116,6 +127,44 @@ resource "aws_ssm_parameter" "runner_ami_id" {
   )
 }
 
+locals {
+  # All-null defaults so both branches below share one object type.
+  network_interfaces_zero = {
+    associate_carrier_ip_address      = null
+    associate_public_ip_address       = null
+    delete_on_termination             = null
+    description                       = null
+    device_index                      = null
+    interface_type                    = null
+    ipv4_address_count                = null
+    ipv4_addresses                    = null
+    ipv4_prefix_count                 = null
+    ipv4_prefixes                     = null
+    ipv6_address_count                = null
+    ipv6_addresses                    = null
+    ipv6_prefix_count                 = null
+    ipv6_prefixes                     = null
+    network_card_index                = null
+    network_interface_id              = null
+    primary_ipv6                      = null
+    private_ip_address                = null
+    security_groups                   = null
+    subnet_id                         = null
+    connection_tracking_specification = null
+    ena_srd_specification             = null
+  }
+
+  network_interfaces = length(var.network_interfaces) > 0 ? var.network_interfaces : (
+    var.associate_public_ipv4_address ? [merge(local.network_interfaces_zero, {
+      associate_public_ip_address = true
+      security_groups = compact(concat(
+        var.enable_managed_runner_security_group ? [aws_security_group.runner_sg[0].id] : [],
+        var.runner_additional_security_group_ids,
+      ))
+    })] : []
+  )
+}
+
 resource "aws_launch_template" "runner" {
   name = "${var.prefix}-action-runner"
 
@@ -125,14 +174,15 @@ resource "aws_launch_template" "runner" {
       device_name = block_device_mappings.value.device_name
 
       ebs {
-        delete_on_termination = block_device_mappings.value.delete_on_termination
-        encrypted             = block_device_mappings.value.encrypted
-        iops                  = block_device_mappings.value.iops
-        kms_key_id            = block_device_mappings.value.kms_key_id
-        snapshot_id           = block_device_mappings.value.snapshot_id
-        throughput            = block_device_mappings.value.throughput
-        volume_size           = block_device_mappings.value.volume_size
-        volume_type           = block_device_mappings.value.volume_type
+        delete_on_termination      = block_device_mappings.value.delete_on_termination
+        encrypted                  = block_device_mappings.value.encrypted
+        iops                       = block_device_mappings.value.iops
+        kms_key_id                 = block_device_mappings.value.kms_key_id
+        snapshot_id                = block_device_mappings.value.snapshot_id
+        throughput                 = block_device_mappings.value.throughput
+        volume_initialization_rate = block_device_mappings.value.volume_initialization_rate
+        volume_size                = block_device_mappings.value.volume_size
+        volume_type                = block_device_mappings.value.volume_type
       }
     }
   }
@@ -166,8 +216,10 @@ resource "aws_launch_template" "runner" {
   dynamic "cpu_options" {
     for_each = var.cpu_options != null ? [var.cpu_options] : []
     content {
-      core_count       = try(cpu_options.value.core_count, null)
-      threads_per_core = try(cpu_options.value.threads_per_core, null)
+      core_count            = try(cpu_options.value.core_count, null)
+      threads_per_core      = try(cpu_options.value.threads_per_core, null)
+      amd_sev_snp           = try(cpu_options.value.amd_sev_snp, null)
+      nested_virtualization = try(cpu_options.value.nested_virtualization, null)
     }
   }
 
@@ -186,12 +238,19 @@ resource "aws_launch_template" "runner" {
     }
   }
 
+  dynamic "license_specification" {
+    for_each = var.license_specifications
+    content {
+      license_configuration_arn = license_specification.value.license_configuration_arn
+    }
+  }
+
   monitoring {
     enabled = var.enable_runner_detailed_monitoring
   }
 
   iam_instance_profile {
-    name = aws_iam_instance_profile.runner.name
+    name = var.iam_overrides["override_instance_profile"] ? var.iam_overrides["instance_profile_name"] : aws_iam_instance_profile.runner[0].name
   }
 
   instance_initiated_shutdown_behavior = "terminate"
@@ -267,21 +326,57 @@ resource "aws_launch_template" "runner" {
     )
   }
 
-  user_data = var.runner_os == "windows" ? base64encode(local.user_data) : base64gzip(local.user_data)
+  user_data = local.encoded_user_data
 
   tags = local.tags
 
   update_default_version = true
 
   dynamic "network_interfaces" {
-    for_each = var.associate_public_ipv4_address ? [var.associate_public_ipv4_address] : []
-    iterator = associate_public_ipv4_address
+    for_each = local.network_interfaces
     content {
-      associate_public_ip_address = associate_public_ipv4_address.value
-      security_groups = compact(concat(
-        var.enable_managed_runner_security_group ? [aws_security_group.runner_sg[0].id] : [],
-        var.runner_additional_security_group_ids,
-      ))
+      associate_carrier_ip_address = try(network_interfaces.value.associate_carrier_ip_address, null)
+      associate_public_ip_address  = try(network_interfaces.value.associate_public_ip_address, null)
+      delete_on_termination        = try(network_interfaces.value.delete_on_termination, null)
+      description                  = try(network_interfaces.value.description, null)
+      device_index                 = try(network_interfaces.value.device_index, null)
+      interface_type               = try(network_interfaces.value.interface_type, null)
+      ipv4_address_count           = try(network_interfaces.value.ipv4_address_count, null)
+      ipv4_addresses               = try(network_interfaces.value.ipv4_addresses, null)
+      ipv4_prefix_count            = try(network_interfaces.value.ipv4_prefix_count, null)
+      ipv4_prefixes                = try(network_interfaces.value.ipv4_prefixes, null)
+      ipv6_address_count           = try(network_interfaces.value.ipv6_address_count, null)
+      ipv6_addresses               = try(network_interfaces.value.ipv6_addresses, null)
+      ipv6_prefix_count            = try(network_interfaces.value.ipv6_prefix_count, null)
+      ipv6_prefixes                = try(network_interfaces.value.ipv6_prefixes, null)
+      network_card_index           = try(network_interfaces.value.network_card_index, null)
+      network_interface_id         = try(network_interfaces.value.network_interface_id, null)
+      primary_ipv6                 = try(network_interfaces.value.primary_ipv6, null)
+      private_ip_address           = try(network_interfaces.value.private_ip_address, null)
+      security_groups              = try(network_interfaces.value.security_groups, null)
+      subnet_id                    = try(network_interfaces.value.subnet_id, null)
+
+      dynamic "connection_tracking_specification" {
+        for_each = try(network_interfaces.value.connection_tracking_specification, null) != null ? [network_interfaces.value.connection_tracking_specification] : []
+        content {
+          tcp_established_timeout = try(connection_tracking_specification.value.tcp_established_timeout, null)
+          udp_stream_timeout      = try(connection_tracking_specification.value.udp_stream_timeout, null)
+          udp_timeout             = try(connection_tracking_specification.value.udp_timeout, null)
+        }
+      }
+
+      dynamic "ena_srd_specification" {
+        for_each = try(network_interfaces.value.ena_srd_specification, null) != null ? [network_interfaces.value.ena_srd_specification] : []
+        content {
+          ena_srd_enabled = try(ena_srd_specification.value.ena_srd_enabled, null)
+          dynamic "ena_srd_udp_specification" {
+            for_each = try(ena_srd_specification.value.ena_srd_udp_specification, null) != null ? [ena_srd_specification.value.ena_srd_udp_specification] : []
+            content {
+              ena_srd_udp_enabled = try(ena_srd_udp_specification.value.ena_srd_udp_enabled, null)
+            }
+          }
+        }
+      }
     }
   }
 }
